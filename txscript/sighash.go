@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"sync"
 
 	"github.com/btcsuite/btcd/chainhash/v2"
 	"github.com/btcsuite/btcd/wire/v2"
@@ -40,32 +41,84 @@ const (
 	blankCodeSepValue = math.MaxUint32
 )
 
-// shallowCopyTx creates a shallow copy of the transaction for use when
-// calculating the signature hash.  It is used over the Copy method on the
-// transaction itself since that is a deep copy and therefore does more work and
-// allocates much more space than needed.
-func shallowCopyTx(tx *wire.MsgTx) wire.MsgTx {
-	// As an additional memory optimization, use contiguous backing arrays
-	// for the copied inputs and outputs and point the final slice of
-	// pointers into the contiguous arrays.  This avoids a lot of small
-	// allocations.
-	txCopy := wire.MsgTx{
-		Version:  tx.Version,
-		TxIn:     make([]*wire.TxIn, len(tx.TxIn)),
-		TxOut:    make([]*wire.TxOut, len(tx.TxOut)),
-		LockTime: tx.LockTime,
+// shallowTxBuf carries the four heap-resident pieces a legacy sighash
+// computation needs: the (per-input) TxIn backing array, the (per-output)
+// TxOut backing array, and the two pointer slices the wire.MsgTx layout
+// requires.  The struct itself is pooled; the backing slices grow on
+// demand and are reused across calls to amortize allocation.
+type shallowTxBuf struct {
+	txIns  []wire.TxIn
+	txOuts []wire.TxOut
+	inPtr  []*wire.TxIn
+	outPtr []*wire.TxOut
+}
+
+// shallowTxPool reuses the per-call temp storage that shallowCopyTx used
+// to allocate from scratch.  Buffers are grown to fit the largest tx
+// the pool has seen and clipped back to needed length on Get.
+var shallowTxPool = sync.Pool{
+	New: func() any { return new(shallowTxBuf) },
+}
+
+// shallowCopyTx populates a wire.MsgTx whose TxIn / TxOut slices point at
+// pool-owned backing storage.  The returned release function MUST be
+// called once the caller is done reading the copy; it returns the
+// backing arrays to the pool.  Calling release more than once is safe
+// but pointless, and a missed release simply turns the optimization
+// into a normal alloc + GC.
+//
+// The copy itself is a true shallow copy of tx — the per-TxIn and
+// per-TxOut fields are bitwise-copied so the caller can mutate the
+// copy (e.g. zero out non-current SignatureScripts) without affecting
+// the original transaction.
+func shallowCopyTx(tx *wire.MsgTx) (wire.MsgTx, func()) {
+	buf := shallowTxPool.Get().(*shallowTxBuf)
+	nIn := len(tx.TxIn)
+	nOut := len(tx.TxOut)
+
+	if cap(buf.txIns) < nIn {
+		buf.txIns = make([]wire.TxIn, nIn)
+		buf.inPtr = make([]*wire.TxIn, nIn)
+	} else {
+		buf.txIns = buf.txIns[:nIn]
+		buf.inPtr = buf.inPtr[:nIn]
 	}
-	txIns := make([]wire.TxIn, len(tx.TxIn))
+	if cap(buf.txOuts) < nOut {
+		buf.txOuts = make([]wire.TxOut, nOut)
+		buf.outPtr = make([]*wire.TxOut, nOut)
+	} else {
+		buf.txOuts = buf.txOuts[:nOut]
+		buf.outPtr = buf.outPtr[:nOut]
+	}
+
 	for i, oldTxIn := range tx.TxIn {
-		txIns[i] = *oldTxIn
-		txCopy.TxIn[i] = &txIns[i]
+		buf.txIns[i] = *oldTxIn
+		buf.inPtr[i] = &buf.txIns[i]
 	}
-	txOuts := make([]wire.TxOut, len(tx.TxOut))
 	for i, oldTxOut := range tx.TxOut {
-		txOuts[i] = *oldTxOut
-		txCopy.TxOut[i] = &txOuts[i]
+		buf.txOuts[i] = *oldTxOut
+		buf.outPtr[i] = &buf.txOuts[i]
 	}
-	return txCopy
+
+	release := func() {
+		// Drop pointers to script byte slices so the GC can reclaim
+		// them; the backing arrays themselves go back to the pool.
+		for i := range buf.txIns {
+			buf.txIns[i].SignatureScript = nil
+			buf.txIns[i].Witness = nil
+		}
+		for i := range buf.txOuts {
+			buf.txOuts[i].PkScript = nil
+		}
+		shallowTxPool.Put(buf)
+	}
+
+	return wire.MsgTx{
+		Version:  tx.Version,
+		TxIn:     buf.inPtr,
+		TxOut:    buf.outPtr,
+		LockTime: tx.LockTime,
+	}, release
 }
 
 // CalcSignatureHash will, given a script and hash type for the current script
@@ -117,8 +170,10 @@ func calcSignatureHash(sigScript []byte, hashType SigHashType, tx *wire.MsgTx, i
 	sigScript = removeOpcodeRaw(sigScript, OP_CODESEPARATOR)
 
 	// Make a shallow copy of the transaction, zeroing out the script for
-	// all inputs that are not currently being processed.
-	txCopy := shallowCopyTx(tx)
+	// all inputs that are not currently being processed.  The backing
+	// storage is pooled; release it before returning.
+	txCopy, release := shallowCopyTx(tx)
+	defer release()
 	for i := range txCopy.TxIn {
 		if i == idx {
 			txCopy.TxIn[idx].SignatureScript = sigScript
