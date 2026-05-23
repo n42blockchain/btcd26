@@ -359,20 +359,73 @@ according to your environment.
 
 ---
 
-## 8. Future work
+## 8. History pruning (`--prunetocheckpoint`)
+
+A coarser-grained prune than Bitcoin Core's size-based `--prune`:
+when the chain catches up past the most recent hard-coded checkpoint,
+delete every `.fdb` file that sits entirely below it.  Headers stay
+in the block index so the chain still verifies; only the raw block
+bytes for pre-checkpoint heights disappear.  On mainnet, that's
+roughly two thirds of the on-disk footprint (the chain's first
+~870 k blocks vs. the ~80 k post-checkpoint blocks).
+
+### Pieces
+
+| Piece | Where | What it does |
+|---|---|---|
+| `--prunetocheckpoint` flag | `config.go` | Opt-in; mutually exclusive with `--prune`, `--txindex`, `--addrindex` (those need block data). |
+| `BlockChainConfig.PruneToCheckpoint` | `blockchain/chain.go` | Carried through to `BlockChain.pruneToCheckpoint`. |
+| `BlockFileLocator` interface | `database/interface.go` | Optional driver capability: `BlockFileNum(hash)` and `PruneBlockFilesBefore(keepFromFileNum)`.  mdbxdb implements it; ffldb does not. |
+| `mdbxdb.transaction.PruneBlockFilesBefore` | `database/mdbxdb/tx.go` | Marks `.fdb` files for delete and drops matching block-index rows in one transaction.  Cold-segment locations are skipped. |
+| `BlockChain.MaybePruneToLatestCheckpoint` | `blockchain/chain.go` | Idempotent driver: looks up the checkpoint's owning file number, calls the locator, logs the result.  Takes `chainLock` for writing for the (sub-second) transaction. |
+| Triggers | `netsync/manager.go`, `server.go` | Called at IBD-complete (the moment `ibdMode` flips false) and once at startup so a restart with the flag freshly enabled also prunes. |
+| Service-flag fix-up | `server.go` | When pruning is on, drop `SFNodeNetwork` so peers correctly classify us as `SFNodeNetworkLimited` and don't ask for blocks we no longer hold. |
+
+### Why this design
+
+Bitcoin Core prunes by size (delete oldest until below target).  That
+involves continuous bookkeeping during normal block append and
+careful interaction with the spend-journal flush cadence.  We avoid
+all of it by pruning *only* at well-defined moments and *only* at
+file granularity:
+
+- Files are append-only and homogeneous in policy: blocks below the
+  checkpoint can never be needed for reorg (checkpoints forbid
+  rewriting them) and are not needed for indexers either (we refuse
+  to combine the flag with indexers up front).
+- The spend journal never wrote pre-checkpoint stxos in the first
+  place — `connectBlock`'s `skipUndo` path already short-circuits
+  the write for those heights.  No extra cleanup is required.
+- The on-disk effect is unambiguous: file numbers below `cpFileNum`
+  vanish; everything else is untouched.  `reconcile` on the next open
+  sees the gap and accepts it (BeenPruned reports true).
+
+### Limits / non-goals
+
+- We do not prune block-index rows for the surviving files; the
+  index keeps the (header) data for those heights so chain
+  verification continues to work end-to-end.
+- We do not migrate or rewrite the file containing the checkpoint.
+  Blocks in that file are kept even if they are pre-checkpoint, on
+  the assumption that the disk savings are not worth a re-encode.
+- RPC `getblock` for a pruned block returns the underlying database
+  `ErrBlockNotFound`.  No special "pruned" error type yet.
+
+---
+
+## 9. Future work
 
 In approximate order of expected impact:
 
-1. **`--prune` mode**: keep only headers and recent N blocks of full
-   data, drop everything older.  Bitcoin Core has this; the largest
-   single disk saving available (potentially 95 % of the 350 GB).
-2. **Async `.fdb` writer**: move the raw-block disk write into a
+1. **Async `.fdb` writer**: move the raw-block disk write into a
    write-back queue so `ProcessBlock` doesn't stall on it.
-3. **Slab-allocated UTXO entries**: collapse the per-entry `pkScript
+2. **Slab-allocated UTXO entries**: collapse the per-entry `pkScript
    []byte` indirection into an inline-or-slab representation so GC
    mark walks scan fewer pointers.
-4. **Header-only sync mode for archive-light peers**: serve headers
-   to other nodes without serving the block bytes we may have pruned.
-
-Items 1 + 4 together would let btcd run useful node service from a
-fraction of the disk currently required.
+3. **Size-target prune (`--prune`) running alongside header-only
+   archive**: combine Core-style continuous pruning with the
+   `--prunetocheckpoint` one-shot for nodes that want only the very
+   recent tail.
+4. **Pruned-block RPC error type**: surface a distinct error code so
+   wallets know to ask a different node for historical data instead
+   of treating the response as "block doesn't exist."
