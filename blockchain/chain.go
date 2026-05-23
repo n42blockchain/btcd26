@@ -1240,10 +1240,32 @@ func (b *BlockChain) connectBestChain(node *blockNode, block *btcutil.Block, fla
 			}
 		}
 
-		// Connect the transactions to the cache.  All the txs are considered valid
-		// at this point as they have passed validation or was considered valid already.
-		stxos := make([]SpentTxOut, 0, countSpentOutputs(block))
-		err := b.utxoCache.connectTransactions(block, &stxos)
+		// Connect the transactions to the cache.  All the txs are
+		// considered valid at this point as they have passed
+		// validation or was considered valid already.
+		//
+		// The stxos slice is only used to (a) write the spend journal
+		// and (b) feed indexers.  Skip building it entirely when both
+		// are unused: pre-checkpoint heights short-circuit the spend
+		// journal (see connectBlock's skipUndo) and many deployments
+		// run without indexers.  At IBD scale this saves ~200 KiB of
+		// short-lived allocations per block (~6 MiB/s churn at
+		// pre-checkpoint speeds), which the GC was scanning for free
+		// before.
+		skipUndo := false
+		if cp := b.LatestCheckpoint(); cp != nil &&
+			node.height <= cp.Height {
+			skipUndo = true
+		}
+		needStxos := !skipUndo || b.indexManager != nil
+
+		var stxos []SpentTxOut
+		var stxosPtr *[]SpentTxOut
+		if needStxos {
+			stxos = make([]SpentTxOut, 0, countSpentOutputs(block))
+			stxosPtr = &stxos
+		}
+		err := b.utxoCache.connectTransactions(block, stxosPtr)
 		if err != nil {
 			return false, err
 		}
