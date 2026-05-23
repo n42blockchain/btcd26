@@ -56,3 +56,6 @@ coverage.txt.bak
 
 .DS_Store
 .aider*
+
+# Test fixture databases - regenerated at test time
+blockchain/testdbs/

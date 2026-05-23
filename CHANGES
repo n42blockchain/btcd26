@@ -3,6 +3,35 @@ User visible changes for btcd
   A full-node bitcoin implementation written in Go
 ============================================================================
 
+Changes in 0.27.0 (unreleased)
+  - Storage engine:
+    - NEW: mdbxdb driver, an MDBX-based storage backend that replaces
+      ffldb's goleveldb metadata store while retaining ffldb's flat .fdb
+      block files.  Becomes the default backend (--dbtype=mdbxdb).
+    - Application-layer per-table compression (zstd-3 by default,
+      zstd-dict optional): utxosetv2 and spendjournal use zstd-3;
+      addridx uses zstd-6.  Codec fingerprint is persisted to the meta
+      table; opening a database with a different codec fails fast
+      instead of silently corrupting data.
+    - Cold-segment block storage: rolled-up old blocks live in
+      dict-zstd compressed .seg files under <db>/cold/, transparently
+      addressed by setting the high bit of the block-index file number.
+      Hot path (recent N blocks) keeps the .fdb format unchanged so
+      deep reorgs perform identically.
+    - CGO is now required for the default backend.  To opt out, build
+      with -tags=noinstall_mdbxdb (TBD) or set --dbtype=ffldb.
+  - New tooling:
+    - cmd/btcd-migrate: streaming ffldb -> mdbxdb migration with
+      optional --verify spot-check.  Block files are hard-linked when
+      the source and destination share a filesystem so migration is
+      effectively free of bulk I/O.
+    - cmd/btcd-segbuild: offline tool that packs the oldest hot .fdb
+      blocks into a new cold segment and rewrites their block-index
+      rows.  Use --hot-keep to control the retention window (default
+      4032 blocks ~= 4 weeks).
+    - cmd/btcd-traindict: samples values from a target bucket and
+      emits a corpus file suitable for `zstd --train`.
+
 Changes in 0.22.0 (Tue Jun 01 2021)
   - Protocol and network-related changes:
     - Add support for witness tx and block in notfound msg (#1625)

@@ -17,7 +17,6 @@ import (
 	"github.com/btcsuite/btcd/chaincfg/v2"
 	"github.com/btcsuite/btcd/chainhash/v2"
 	"github.com/btcsuite/btcd/database"
-	"github.com/btcsuite/btcd/database/ffldb"
 	"github.com/btcsuite/btcd/wire/v2"
 )
 
@@ -781,8 +780,10 @@ func TestFlushOnPrune(t *testing.T) {
 		}
 	}
 
-	// Sync the chain.
-	ffldb.TstRunWithMaxBlockFileSize(chain.db, maxBlockFileSize, syncBlocks)
+	// Sync the chain with a smaller max block file size so the prune
+	// path is triggered.  The driver-specific helpers all take the same
+	// (db, size, fn) shape; dispatch on the active testDbType.
+	runWithMaxBlockFileSize(chain.db, maxBlockFileSize, syncBlocks)
 
 	// Function that errors out if the block that should exist doesn't exist.
 	shouldExist := func(dbTx database.Tx, blockHash *chainhash.Hash) error {

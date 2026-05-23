@@ -195,6 +195,22 @@ type Bucket interface {
 	Delete(key []byte) error
 }
 
+// KVPair is a key/value pair for batch operations on a Bucket.
+type KVPair struct {
+	Key   []byte
+	Value []byte
+}
+
+// BatchPutter is an optional interface a Bucket implementation may also
+// satisfy to accelerate large flush operations.  When the underlying
+// store has an expensive per-entry encoding step (e.g. zstd compression),
+// PutBatch can encode many values in parallel before writing them
+// serially to the underlying transaction.  Callers must type-assert
+// and fall back to Put-in-a-loop when not satisfied.
+type BatchPutter interface {
+	PutBatch(pairs []KVPair) error
+}
+
 // BlockRegion specifies a particular region of a block identified by the
 // specified hash, given an offset and length.
 type BlockRegion struct {

@@ -31,9 +31,11 @@ require (
 	github.com/aead/siphash v1.0.1 // indirect
 	github.com/decred/dcrd/crypto/blake256 v1.1.0 // indirect
 	github.com/decred/dcrd/dcrec/secp256k1/v4 v4.4.0 // indirect
+	github.com/erigontech/mdbx-go v0.40.0 // indirect
 	github.com/golang/snappy v1.0.0 // indirect
 	github.com/kcalvinalvin/anet v0.0.0-20251112173137-d8ddc1f6dbee // indirect
 	github.com/kkdai/bstream v1.0.0 // indirect
+	github.com/klauspost/compress v1.18.6 // indirect
 	github.com/pmezard/go-difflib v1.0.0 // indirect
 	github.com/stretchr/objx v0.5.2 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect

@@ -30,6 +30,7 @@ import (
 	"github.com/btcsuite/btcd/connmgr"
 	"github.com/btcsuite/btcd/database"
 	_ "github.com/btcsuite/btcd/database/ffldb"
+	_ "github.com/btcsuite/btcd/database/mdbxdb"
 	"github.com/btcsuite/btcd/mempool"
 	"github.com/btcsuite/btcd/peer"
 	"github.com/btcsuite/btcd/wire/v2"
@@ -50,7 +51,7 @@ const (
 	defaultMaxRPCClients         = 10
 	defaultMaxRPCWebsockets      = 25
 	defaultMaxRPCConcurrentReqs  = 20
-	defaultDbType                = "ffldb"
+	defaultDbType                = "mdbxdb"
 	defaultFreeTxRelayLimit      = 15.0
 	defaultTrickleInterval       = peer.DefaultTrickleInterval
 	defaultBlockMinSize          = 0

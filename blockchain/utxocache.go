@@ -504,6 +504,24 @@ func (s *utxoCache) writeCache(dbTx database.Tx, bestState *BestState) error {
 	// NOTE: The database has its own cache which gets atomically written
 	// to leveldb.
 	utxoBucket := dbTx.Metadata().Bucket(utxoSetBucketName)
+
+	// If the bucket implementation supports batched puts (mdbxdb does)
+	// collect the live entries into a single slice and submit them in
+	// one call.  This lets the backend parallelize the per-entry
+	// codec encode (zstd-3 over ~30 M UTXOs is the dominant cost of
+	// a multi-GiB flush) instead of doing it serially in this loop.
+	batcher, _ := utxoBucket.(database.BatchPutter)
+
+	var batch []database.KVPair
+	if batcher != nil {
+		// Preallocate roughly to expected live-entry count.
+		approxLive := 0
+		for i := range s.cachedEntries.maps {
+			approxLive += len(s.cachedEntries.maps[i])
+		}
+		batch = make([]database.KVPair, 0, approxLive)
+	}
+
 	for i := range s.cachedEntries.maps {
 		for outpoint, entry := range s.cachedEntries.maps[i] {
 			switch {
@@ -518,14 +536,32 @@ func (s *utxoCache) writeCache(dbTx database.Tx, bestState *BestState) error {
 			// No need to update the cache if the entry was not modified.
 			case !entry.isModified():
 			default:
-				// Entry is fresh and needs to be put into the database.
-				err := dbPutUtxoEntry(utxoBucket, outpoint, entry)
-				if err != nil {
-					return err
+				if batcher != nil {
+					// Stage into the batch — actual encode +
+					// write happens below via PutBatch.
+					serialized, err := serializeUtxoEntry(entry)
+					if err != nil {
+						return err
+					}
+					key := outpointKey(outpoint)
+					batch = append(batch, database.KVPair{
+						Key: *key, Value: serialized,
+					})
+				} else {
+					// Entry is fresh and needs to be put into the database.
+					err := dbPutUtxoEntry(utxoBucket, outpoint, entry)
+					if err != nil {
+						return err
+					}
 				}
 			}
 
 			delete(s.cachedEntries.maps[i], outpoint)
+		}
+	}
+	if batcher != nil && len(batch) > 0 {
+		if err := batcher.PutBatch(batch); err != nil {
+			return err
 		}
 	}
 	s.cachedEntries.deleteMaps()

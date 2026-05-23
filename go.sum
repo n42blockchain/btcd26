@@ -32,6 +32,8 @@ github.com/decred/dcrd/dcrec/secp256k1/v4 v4.4.0 h1:NMZiJj8QnKe1LgsbDayM4UoHwbvw
 github.com/decred/dcrd/dcrec/secp256k1/v4 v4.4.0/go.mod h1:ZXNYxsqcloTdSy/rNShjYzMhyjf0LaoftYK0p+A3h40=
 github.com/decred/dcrd/lru v1.1.3 h1:w9EAbvGLyzm6jTjF83UKuqZEiUtJmvRhQDOCEIvSuE0=
 github.com/decred/dcrd/lru v1.1.3/go.mod h1:Tw0i0pJyiLEx/oZdHLe1Wdv/Y7EGzAX+sYftnmxBR4o=
+github.com/erigontech/mdbx-go v0.40.0 h1:wbjPSyF/jQWafvNYZOkz93m2kZRnh2MN5OkH6kOroGs=
+github.com/erigontech/mdbx-go v0.40.0/go.mod h1:tHUS492F5YZvccRqatNdpTDQAaN+Vv4HRARYq89KqeY=
 github.com/fsnotify/fsnotify v1.4.7/go.mod h1:jwhsz4b93w/PPRr/qN1Yymfu8t87LnFCMoQvtojpjFo=
 github.com/fsnotify/fsnotify v1.4.9 h1:hsms1Qyu0jgnwNXIxa+/V/PDsU6CfLf6CNO8H7IWoS4=
 github.com/fsnotify/fsnotify v1.4.9/go.mod h1:znqG4EE+3YCdAaPaxE2ZRY/06pZUdp0tY4IgpuI1SZQ=
@@ -59,6 +61,8 @@ github.com/kcalvinalvin/anet v0.0.0-20251112173137-d8ddc1f6dbee h1:FPP9HDkBbPyni
 github.com/kcalvinalvin/anet v0.0.0-20251112173137-d8ddc1f6dbee/go.mod h1:N6sz6HwJAenJ6d+/xmSl0ikfV05ZrVGmjt1ryy/WOtE=
 github.com/kkdai/bstream v1.0.0 h1:Se5gHwgp2VT2uHfDrkbbgbgEvV9cimLELwrPJctSjg8=
 github.com/kkdai/bstream v1.0.0/go.mod h1:FDnDOHt5Yx4p3FaHcioFT0QjDOtgUpvjeZqAs+NVZZA=
+github.com/klauspost/compress v1.18.6 h1:2jupLlAwFm95+YDR+NwD2MEfFO9d4z4Prjl1XXDjuao=
+github.com/klauspost/compress v1.18.6/go.mod h1:cwPg85FWrGar70rWktvGQj8/hthj3wpl0PGDogxkrSQ=
 github.com/nxadm/tail v1.4.4 h1:DQuhQpB1tVlglWS2hLQ5OV6B5r8aGxSrPc5Qo6uTN78=
 github.com/nxadm/tail v1.4.4/go.mod h1:kenIhsEOeOJmVchQTgglprH7qJGnHDVpk1VPCcaMI8A=
 github.com/onsi/ginkgo v1.6.0/go.mod h1:lLunBs/Ym6LB5Z9jYTR76FiuTmxDTDusOGeTQH+WWjE=

@@ -335,7 +335,7 @@ func warnMultipleDBs() {
 	// This is intentionally not using the known db types which depend
 	// on the database types compiled into the binary since we want to
 	// detect legacy db types as well.
-	dbTypes := []string{"ffldb", "leveldb", "sqlite"}
+	dbTypes := []string{"ffldb", "mdbxdb", "leveldb", "sqlite"}
 	duplicateDbPaths := make([]string, 0, len(dbTypes)-1)
 	for _, dbType := range dbTypes {
 		if dbType == cfg.DbType {
