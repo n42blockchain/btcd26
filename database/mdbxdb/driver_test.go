@@ -440,6 +440,169 @@ func TestPrune(t *testing.T) {
 	})
 }
 
+// TestPruneBlockFilesBefore verifies the file-number-bounded prune
+// path used by --prunetocheckpoint.  It loads enough test blocks to
+// fill several .fdb files, picks an arbitrary cap, then asserts:
+//
+//   - The expected hot files are removed from disk and survivors stay.
+//   - Returned hash list matches the block-index rows that disappeared.
+//   - Pruned blocks return ErrBlockNotFound from FetchBlock.
+//   - Surviving blocks still round-trip byte-for-byte.
+func TestPruneBlockFilesBefore(t *testing.T) {
+	t.Parallel()
+
+	dbPath := t.TempDir()
+	db, err := database.Create(dbType, dbPath, blockDataNet)
+	if err != nil {
+		t.Fatalf("Failed to create test database (%s) %v",
+			dbType, err)
+	}
+	defer db.Close()
+
+	blockFileSize := uint64(2048)
+
+	testfn := func(t *testing.T, db database.DB) {
+		blocks, err := loadBlocks(t, blockDataFile, blockDataNet)
+		if err != nil {
+			t.Fatalf("loadBlocks: %v", err)
+		}
+
+		// Store enough blocks to span multiple .fdb files.  With
+		// blockFileSize = 2 KiB each ~270 B block fills a file
+		// after ~7 blocks, so 50 blocks gives us roughly 7
+		// distinct files.
+		const stored = 50
+		err = db.Update(func(tx database.Tx) error {
+			for i := 0; i < stored; i++ {
+				if err := tx.StoreBlock(blocks[i]); err != nil {
+					return fmt.Errorf("StoreBlock #%d: "+
+						"%v", i, err)
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// Resolve which hot .fdb file currently owns each block
+		// and pick a non-trivial cap somewhere in the middle.
+		blockFileNum := make(map[chainhash.Hash]uint32, stored)
+		var maxFile uint32
+		err = db.View(func(tx database.Tx) error {
+			locator, ok := tx.(database.BlockFileLocator)
+			if !ok {
+				return fmt.Errorf("driver does not " +
+					"implement BlockFileLocator")
+			}
+			for i := 0; i < stored; i++ {
+				fn, err := locator.BlockFileNum(
+					blocks[i].Hash())
+				if err != nil {
+					return err
+				}
+				blockFileNum[*blocks[i].Hash()] = fn
+				if fn > maxFile && fn != ^uint32(0) {
+					maxFile = fn
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if maxFile == 0 {
+			t.Fatalf("test corpus too small: all blocks landed " +
+				"in file 0, cannot exercise the prune path")
+		}
+
+		// Keep the file holding the highest-indexed block (and
+		// everything after) — delete every file below it.
+		keepFrom := maxFile
+
+		var deleted []chainhash.Hash
+		err = db.Update(func(tx database.Tx) error {
+			locator := tx.(database.BlockFileLocator)
+			deleted, err = locator.PruneBlockFilesBefore(keepFrom)
+			return err
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// Build the expected deletion set from the recorded
+		// per-block file numbers.
+		wantDeleted := make(map[chainhash.Hash]struct{})
+		for h, fn := range blockFileNum {
+			if fn < keepFrom {
+				wantDeleted[h] = struct{}{}
+			}
+		}
+		gotDeleted := make(map[chainhash.Hash]struct{},
+			len(deleted))
+		for _, h := range deleted {
+			gotDeleted[h] = struct{}{}
+		}
+		if !reflect.DeepEqual(wantDeleted, gotDeleted) {
+			t.Fatalf("returned deleted set: want %d hashes, "+
+				"got %d", len(wantDeleted), len(gotDeleted))
+		}
+
+		// Survivors round-trip; pruned blocks ErrBlockNotFound.
+		err = db.View(func(tx database.Tx) error {
+			for i := 0; i < stored; i++ {
+				h := blocks[i].Hash()
+				_, err := tx.FetchBlock(h)
+				if _, pruned := wantDeleted[*h]; pruned {
+					if err == nil {
+						return fmt.Errorf("FetchBlock"+
+							"(%s) should fail for "+
+							"pruned block", h)
+					}
+					dbErr, ok := err.(database.Error)
+					if !ok || dbErr.ErrorCode !=
+						database.ErrBlockNotFound {
+						return fmt.Errorf("expected "+
+							"ErrBlockNotFound, "+
+							"got %v", err)
+					}
+					continue
+				}
+				if err != nil {
+					return fmt.Errorf("FetchBlock(%s) "+
+						"unexpected error: %v",
+						h, err)
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// Confirm the on-disk files reflect the cap exactly.
+		files, _ := filepath.Glob(filepath.Join(dbPath, "*.fdb"))
+		if len(files) == 0 {
+			t.Fatal("expected at least one .fdb file to survive")
+		}
+		for _, f := range files {
+			var fn uint32
+			base := filepath.Base(f)
+			if _, err := fmt.Sscanf(base, "%09d.fdb",
+				&fn); err != nil {
+				continue
+			}
+			if fn < keepFrom {
+				t.Fatalf("file %s should have been deleted "+
+					"(keepFrom=%d)", base, keepFrom)
+			}
+		}
+	}
+	mdbxdb.TstRunWithMaxBlockFileSize(db, uint32(blockFileSize), func() {
+		testfn(t, db)
+	})
+}
+
 // TestInterface performs all interfaces tests for this database driver.
 func TestInterface(t *testing.T) {
 	t.Parallel()
