@@ -1338,6 +1338,52 @@ func (b *BlockChain) connectBestChain(node *blockNode, block *btcutil.Block, fla
 	// blocks that form the (now) old fork from the main chain, and attach
 	// the blocks that form the new chain to the main chain starting at the
 	// common ancenstor (the point where the chain forked).
+
+	// Refuse reorgs whose fork point sits below any hard-coded
+	// checkpoint.  Pre-checkpoint blocks are final by definition (the
+	// checkpoint hash anchors a single canonical history); accepting a
+	// reorg there means trusting a peer to overwrite a span the protocol
+	// has already declared immutable.  In practice this blocks the
+	// "early-mainnet BIP-30 duplicate fork" DoS — a malicious peer
+	// advertises an alternate chain that forks at height ~170 with a
+	// coinbase whose txid collides with the canonical block's coinbase,
+	// causing the reorg to fail BIP-30 mid-flight and the node to
+	// repeatedly attempt the same doomed reorg every time a peer
+	// re-announces the fork tip.  Bitcoin Core refuses such reorgs by
+	// rejecting headers that don't chain through a checkpoint; we apply
+	// the equivalent guard at the reorg gate.
+	if cp := b.LatestCheckpoint(); cp != nil {
+		forkNode := b.bestChain.FindFork(node)
+		if forkNode != nil && forkNode.height < cp.Height {
+			str := fmt.Sprintf("refusing reorg to %v: fork "+
+				"point at height %d is below latest "+
+				"hard-coded checkpoint at height %d",
+				node.hash, forkNode.height, cp.Height)
+			log.Warn(str)
+			b.index.SetStatusFlags(node, statusValidateFailed)
+			return false, ruleError(ErrForkTooOld, str)
+		}
+	} else if len(b.checkpoints) > 0 {
+		// Tip is still below the first hard-coded checkpoint.  We
+		// know which heights the canonical chain occupies up to
+		// that checkpoint; any side chain rooted in that range
+		// cannot win without contradicting the checkpoint.  Refuse
+		// the reorg and mark the requesting node invalid so the
+		// peer that fed us this fork gets disconnected on its
+		// next attempt.
+		firstCp := b.checkpoints[0]
+		forkNode := b.bestChain.FindFork(node)
+		if forkNode != nil && forkNode.height < firstCp.Height {
+			str := fmt.Sprintf("refusing reorg to %v: fork "+
+				"point at height %d is below first "+
+				"hard-coded checkpoint at height %d",
+				node.hash, forkNode.height, firstCp.Height)
+			log.Warn(str)
+			b.index.SetStatusFlags(node, statusValidateFailed)
+			return false, ruleError(ErrForkTooOld, str)
+		}
+	}
+
 	detachNodes, attachNodes := b.getReorganizeNodes(node)
 
 	// Reorganize the chain.
