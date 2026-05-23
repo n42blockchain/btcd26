@@ -671,9 +671,24 @@ func (b *BlockChain) connectBlock(node *blockNode, block *btcutil.Block,
 
 		// Update the transaction spend journal by adding a record for
 		// the block that contains all txos spent by it.
-		err = dbPutSpendJournalEntry(dbTx, block.Hash(), stxos)
-		if err != nil {
-			return err
+		//
+		// Skip writing for pre-checkpoint blocks: they can never be
+		// reorganized away (CheckBlockHeaderContext enforces the
+		// hard-coded checkpoints), so their undo data is unreachable
+		// and the write is pure overhead.  During IBD this single
+		// write was 73 % of total CPU (each block-sized mdbx Put
+		// involves overflow-page btree updates against the on-disk
+		// tree); skipping it for pre-checkpoint heights is the
+		// biggest single IBD speedup available.
+		skipUndo := false
+		if cp := b.LatestCheckpoint(); cp != nil && node.height <= cp.Height {
+			skipUndo = true
+		}
+		if !skipUndo {
+			err = dbPutSpendJournalEntry(dbTx, block.Hash(), stxos)
+			if err != nil {
+				return err
+			}
 		}
 
 		// Allow the index manager to call each of the currently active
@@ -2110,7 +2125,11 @@ func (b *BlockChain) ReconsiderBlock(hash *chainhash.Hash) error {
 	if err != nil {
 		// If we errored out during the verification of the reorg branch,
 		// it's ok to return nil as we reconsidered the block and determined
-		// that it's invalid.
+		// that it's invalid.  Surface the underlying reason so the
+		// operator can tell whether the block was rightly rejected or
+		// hit a known bug.
+		log.Warnf("Reconsider of %v rejected by reorg verification: %v",
+			hash, err)
 		return nil
 	}
 

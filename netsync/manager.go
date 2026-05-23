@@ -45,6 +45,69 @@ const (
 	// stallSampleInterval the interval at which we will check to see if our
 	// sync has stalled.
 	stallSampleInterval = 30 * time.Second
+
+	// reorderBufferCap is the maximum number of blocks held in the IBD
+	// reorder buffer.  Sized so that the chain advancer keeps busy
+	// during the round-trip it takes peers to refill after the
+	// scheduler kicks them.  With GC pressure tamed by GOGC=300 the
+	// processing rate is ~80 blk/s burst, so a cap of 2048 gives
+	// roughly 25 s of drain head-room — long enough to hide the
+	// latency of peers fetching the next chunk of blocks from disk
+	// and pushing them across the network.  Memory cost at 4 MiB
+	// max-witness blocks: ~8 GiB peak, well under the 20 GiB
+	// GOMEMLIMIT budget.
+	reorderBufferCap = 2048
+
+	// establishedPeerThreshold is the number of successful block
+	// deliveries after which a peer is considered "proven" and gets a
+	// much longer reclaim timeout.  This protects fast IDC peers we
+	// already vetted from being killed alongside genuinely dead ones
+	// during a peer churn storm.
+	establishedPeerThreshold = 32
+
+	// assignChunkSize is the number of contiguous block heights handed
+	// to a single peer per pipeline refill.  Smaller → faster
+	// reassignment on a slow/disconnected peer (the chain head only
+	// stalls on at most chunk-1 missing blocks before reclaim kicks in);
+	// larger → less scheduler overhead.  16 strikes a balance: with 8
+	// peers we have ~128 blocks in flight, and any single slow peer
+	// blocks no more than 16 heights worth of chain advance.
+	assignChunkSize = 16
+
+	// minInFlightPerPeer is the per-peer in-flight threshold below which
+	// the scheduler refills that peer's pipeline with another chunk.
+	// Keep slightly below assignChunkSize so refill happens roughly
+	// every chunk delivered.
+	minInFlightPerPeer = 4
+
+	// peerAssignmentTimeout is how long a peer has to deliver any block
+	// from its current chunk before the scheduler considers it stalled
+	// for that range, reclaims those heights, AND disconnects the peer.
+	// connmgr will replace it with another outbound — during IBD it's
+	// cheaper to lose the link to a slow peer than to keep waiting on
+	// them.  Tuned looser than headOfLineTimeout because this catches
+	// peers that have any in-flight chunk going stale, not just the
+	// head-of-line one.  Post-segwit blocks can legitimately take 10-20s
+	// to deliver over a marginal-bandwidth peer; 30 s avoids killing
+	// those connections while still cleaning up genuinely dead ones.
+	peerAssignmentTimeout = 30 * time.Second
+
+	// headOfLineTimeout is how long the peer holding the next-needed
+	// block (orderedNext) gets to deliver it before checkHeadOfLineStall
+	// fires a *duplicate* getdata to another peer (no disconnect — see
+	// trySpeculativeFetch).  Each duplicate is a full block of wasted
+	// bandwidth, so a tight bound here trades download bandwidth for
+	// chain-advance latency.  5 s strikes a balance: triggers only on
+	// genuinely slow head-of-line peers (typical good-peer block
+	// delivery is well under 2 s) while keeping duplicate volume
+	// manageable.
+	headOfLineTimeout = 5 * time.Second
+
+	// ibdScheduleInterval is how often blockHandler ticks the IBD
+	// scheduler / stall detection.  Short so head-of-line peer detection
+	// fires close to its 2 s target.  Cheap (iterates peerStates +
+	// O(peers*chunkSize) hash compare in the worst case).
+	ibdScheduleInterval = 1 * time.Second
 )
 
 // zeroHash is the zero value hash (all zeros).  It is defined as a convenience.
@@ -150,6 +213,20 @@ type peerSyncState struct {
 	requestQueue    []*wire.InvVect
 	requestedTxns   map[chainhash.Hash]struct{}
 	requestedBlocks map[chainhash.Hash]struct{}
+
+	// lastBlockActivity records the most recent time this peer either
+	// received a chunk assignment or delivered a block.  Used by the
+	// parallel scheduler to detect peers that have gone silent mid-
+	// chunk and reclaim their in-flight heights for other peers.
+	lastBlockActivity time.Time
+
+	// successfulDeliveries counts how many blocks this peer has
+	// successfully delivered during the current connection.  Peers
+	// that cross establishedPeerThreshold are exempted from the
+	// aggressive reclaim timeout — Bitcoin Core's "protected outbound"
+	// concept: once we've proven a peer is reliable and fast, keep
+	// them rather than churning back to an unknown new peer.
+	successfulDeliveries int
 }
 
 // limitAdd is a helper function for maps that require a maximum limit by
@@ -198,6 +275,25 @@ type SyncManager struct {
 
 	// The following fields are used for the initial block download mode.
 	ibdMode bool
+
+	// orderedBlocks is the IBD reorder buffer.  Blocks arriving from any
+	// peer land here keyed by height while drainOrderedBlocks pulls
+	// consecutive entries off starting at orderedNext and feeds them to
+	// ProcessBlock in chain order.  Parallel download / serial apply.
+	// nil when not currently in IBD; sized to reorderBufferCap.
+	orderedBlocks map[int32]*blockMsg
+
+	// orderedNext is the next chain-tip+1 height we'll feed to
+	// ProcessBlock from orderedBlocks.  Zero means uninitialized
+	// (recomputed lazily from chain.BestSnapshot when the first IBD
+	// block arrives).
+	orderedNext int32
+
+	// orderedNextSince is the time orderedNext most recently changed
+	// (advanced) — i.e. how long the head-of-line block has been
+	// outstanding.  Used by checkHeadOfLineStall to identify peers
+	// holding up the chain advancer.
+	orderedNextSince time.Time
 
 	// An optional fee estimator.
 	feeEstimator *mempool.FeeEstimator
@@ -301,8 +397,11 @@ func (sm *SyncManager) startSync() {
 		return
 	}
 
-	// Check to see if we're in the initial block download mode.
+	// Check to see if we're in the initial block download mode.  If
+	// we're not, also drop the conservative ibdMode default that Start
+	// installed so that inv-driven block propagation resumes.
 	if !sm.isInIBDMode() {
+		sm.ibdMode = false
 		return
 	}
 
@@ -354,7 +453,7 @@ func (sm *SyncManager) startSync() {
 
 	log.Infof("Syncing to block height %d from peer %v",
 		sm.syncPeer.LastBlock(), sm.syncPeer.Addr())
-	sm.fetchHeaderBlocks(sm.syncPeer)
+	sm.scheduleParallelFetch()
 }
 
 // isSyncCandidate returns whether or not the peer is a candidate to consider
@@ -690,7 +789,11 @@ func (sm *SyncManager) checkHeadersList(blockHash *chainhash.Hash) (
 	return isCheckpointBlock, behaviorFlags
 }
 
-// handleBlockMsg handles block messages from all peers.
+// handleBlockMsg handles block messages from all peers.  During IBD it does
+// NOT call ProcessBlock directly; instead it parks the block in the reorder
+// buffer (orderedBlocks) and drains the buffer sequentially.  This lets us
+// download blocks in parallel from multiple peers while keeping consensus
+// validation strictly in-order — no orphan-pool round-tripping.
 func (sm *SyncManager) handleBlockMsg(bmsg *blockMsg) {
 	peer := bmsg.peer
 	state, exists := sm.peerStates[peer]
@@ -699,41 +802,134 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockMsg) {
 		return
 	}
 
-	// If we didn't ask for this block then the peer is misbehaving.
+	// Decide whether this block was something we asked for.  During
+	// IBD with speculative re-request we may receive a duplicate from
+	// a second peer that we asked for the same hash; accept those.  A
+	// "truly unsolicited" block is one whose hash isn't in any peer's
+	// in-flight set globally — those mean the peer is sending random
+	// junk and should be disconnected.
 	blockHash := bmsg.block.Hash()
 	if _, exists = state.requestedBlocks[*blockHash]; !exists {
-		// The regression test intentionally sends some blocks twice
-		// to test duplicate block insertion fails.  Don't disconnect
-		// the peer or ignore the block when we're in regression test
-		// mode in this case so the chain code is actually fed the
-		// duplicate blocks.
-		if sm.chainParams.Name != chaincfg.RegressionNetParams.Name {
-			log.Warnf("Got unrequested block %v from %s -- "+
-				"disconnecting", blockHash, peer.Addr())
-			peer.Disconnect()
-			return
+		if _, global := sm.requestedBlocks[*blockHash]; !global {
+			// Regtest sends some blocks twice intentionally; let
+			// those through to exercise duplicate-rejection in
+			// the chain.
+			if sm.chainParams.Name != chaincfg.RegressionNetParams.Name {
+				log.Warnf("Got unrequested block %v from "+
+					"%s -- disconnecting", blockHash,
+					peer.Addr())
+				peer.Disconnect()
+				return
+			}
 		}
+		// Globally requested (e.g. speculative from another peer)
+		// — accept this delivery as if we'd asked this peer too.
 	}
-
-	// Check if the block is eligible for less validation since the headers
-	// have already been verified to link together and are valid up to the
-	// next checkpoint.
-	isCheckpointBlock, behaviorFlags := sm.checkHeadersList(blockHash)
 
 	// Remove block from request maps. Either chain will know about it and
 	// so we shouldn't have any more instances of trying to fetch it, or we
 	// will fail the insert and thus we'll retry next time we get an inv.
-	delete(state.requestedBlocks, *blockHash)
+	// Note we delete from *every* peer's per-peer set because a
+	// speculative request may have left the hash in multiple peers.
+	for _, st := range sm.peerStates {
+		delete(st.requestedBlocks, *blockHash)
+	}
 	delete(sm.requestedBlocks, *blockHash)
 
-	// Process the block to include validation, best chain selection, orphan
-	// handling, etc.
+	// Refresh the peer's activity timestamp so the scheduler doesn't
+	// time out a peer that's actively delivering its assigned chunk.
+	state.lastBlockActivity = time.Now()
+	state.successfulDeliveries++
+
+	// In IBD, route arriving blocks through the reorder buffer so they
+	// are applied in chain order even though they may arrive out of order
+	// from different peers.  Outside IBD a single block at a time arrives
+	// (inv-driven), no buffering needed.
+	if sm.ibdMode {
+		height, err := sm.chain.HeaderHeightByHash(*blockHash)
+		if err == nil {
+			if sm.orderedBlocks == nil {
+				sm.orderedBlocks = make(map[int32]*blockMsg)
+			}
+			if sm.orderedNext == 0 {
+				sm.orderedNext = sm.chain.BestSnapshot().Height + 1
+				sm.orderedNextSince = time.Now()
+			}
+			// Drop speculative duplicates and blocks already
+			// past the chain advancer.
+			if height < sm.orderedNext {
+				return
+			}
+			if _, dup := sm.orderedBlocks[height]; dup {
+				return
+			}
+			sm.orderedBlocks[height] = bmsg
+			sm.drainOrderedBlocks()
+			sm.scheduleParallelFetch()
+			return
+		}
+		// Header height lookup failed (block's header not yet in our
+		// index — shouldn't happen since IBD waits for headers first).
+		// Fall through to direct apply as a safety net.
+	}
+
+	sm.applyBlock(bmsg)
+	if sm.ibdMode {
+		sm.scheduleParallelFetch()
+	}
+}
+
+// drainOrderedBlocks pulls consecutive blocks from the reorder buffer
+// starting at sm.orderedNext and feeds each one to applyBlock in chain
+// order, stopping when a gap is hit or IBD ends.
+//
+// MUST be called from the blockHandler goroutine.
+func (sm *SyncManager) drainOrderedBlocks() {
+	for sm.ibdMode {
+		bmsg, ok := sm.orderedBlocks[sm.orderedNext]
+		if !ok {
+			return
+		}
+		delete(sm.orderedBlocks, sm.orderedNext)
+		sm.orderedNext++
+		sm.orderedNextSince = time.Now()
+
+		sm.applyBlock(bmsg)
+	}
+
+	// IBD transitioned off inside applyBlock — discard any blocks left in
+	// the buffer.  They are at heights past the new tip and will arrive
+	// again via the normal inv flow if/when needed.
+	if !sm.ibdMode {
+		sm.orderedBlocks = nil
+		sm.orderedNext = 0
+		sm.orderedNextSince = time.Time{}
+	}
+}
+
+// applyBlock runs full ProcessBlock validation on bmsg and performs the
+// per-block bookkeeping that used to live inline in handleBlockMsg: peer
+// height updates, progress logging, cache flush outside IBD, and the
+// IBD-complete transition.  Idempotent w.r.t. ibdMode — callers may
+// invoke this from drainOrderedBlocks (parallel IBD path) or directly
+// (single-block inv path).
+func (sm *SyncManager) applyBlock(bmsg *blockMsg) {
+	peer := bmsg.peer
+	blockHash := bmsg.block.Hash()
+
+	// Check if the block is eligible for less validation since the
+	// headers have already been verified to link together and are valid
+	// up to the next checkpoint.
+	isCheckpointBlock, behaviorFlags := sm.checkHeadersList(blockHash)
+
+	// Process the block to include validation, best chain selection,
+	// orphan handling, etc.
 	_, isOrphan, err := sm.chain.ProcessBlock(bmsg.block, behaviorFlags)
 	if err != nil {
-		// When the error is a rule error, it means the block was simply
-		// rejected as opposed to something actually going wrong, so log
-		// it as such.  Otherwise, something really did go wrong, so log
-		// it as an actual error.
+		// When the error is a rule error, it means the block was
+		// simply rejected as opposed to something actually going
+		// wrong, so log it as such.  Otherwise, something really did
+		// go wrong, so log it as an actual error.
 		if _, ok := err.(blockchain.RuleError); ok {
 			log.Infof("Rejected block %v from %s: %v", blockHash,
 				peer, err)
@@ -755,13 +951,7 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockMsg) {
 
 	// Meta-data about the new block this peer is reporting. We use this
 	// below to update this peer's latest block height and the heights of
-	// other peers based on their last announced block hash. This allows us
-	// to dynamically update the block heights of peers, avoiding stale
-	// heights when looking for a new sync peer. Upon acceptance of a block
-	// or recognition of an orphan, we also use this information to update
-	// the block heights over other peers who's invs may have been ignored
-	// if we are actively syncing while the chain is not yet current or
-	// who may have lost the lock announcement race.
+	// other peers based on their last announced block hash.
 	var heightUpdate int32
 	var blkHashUpdate *chainhash.Hash
 
@@ -800,8 +990,8 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockMsg) {
 			sm.lastProgressTime = time.Now()
 		}
 
-		// When the block is not an orphan, log information about it and
-		// update the chain state.
+		// When the block is not an orphan, log information about it
+		// and update the chain state.
 		sm.progressLogger.LogBlockHeight(bmsg.block, sm.chain)
 
 		// Update this peer's latest block height, for future
@@ -826,9 +1016,9 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockMsg) {
 		}
 	}
 
-	// If we are not in the initial block download mode, it's a good time to
-	// periodically flush the blockchain cache because we don't expect new
-	// blocks immediately.  After that, there is nothing more to do.
+	// If we are not in the initial block download mode, it's a good time
+	// to periodically flush the blockchain cache because we don't expect
+	// new blocks immediately.  After that, there is nothing more to do.
 	if !sm.ibdMode {
 		if err := sm.chain.FlushUtxoCache(blockchain.FlushPeriodic); err != nil {
 			log.Errorf("Error while flushing the blockchain cache: %v", err)
@@ -836,8 +1026,8 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockMsg) {
 		return
 	}
 
-	// If we're on a checkpointed block, check if we still have checkpoints
-	// to let the user know if we're switching to normal mode.
+	// If we're on a checkpointed block, check if we still have
+	// checkpoints to let the user know if we're switching to normal mode.
 	if isCheckpointBlock {
 		log.Infof("Continuing IBD, on checkpoint block %v(%v)",
 			bmsg.block.Hash(), bmsg.block.Height())
@@ -848,15 +1038,8 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockMsg) {
 		}
 	}
 
-	// Fetch more blocks if we're still not caught up to the best header and
-	// the number of in-flight blocks has dropped below the minimum threshold.
+	// Detect IBD complete: we've caught up to the best known header.
 	_, lastHeight := sm.chain.BestHeader()
-	if bmsg.block.Height() < lastHeight &&
-		len(state.requestedBlocks) < minInFlightBlocks {
-		sm.fetchHeaderBlocks(sm.syncPeer)
-		return
-	}
-
 	if bmsg.block.Height() >= lastHeight {
 		log.Infof("Finished the initial block download and "+
 			"caught up to block %v(%v) -- now listening to blocks.",
@@ -865,8 +1048,301 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockMsg) {
 	}
 }
 
+// scheduleParallelFetch hands disjoint chunks of the still-missing header
+// range to multiple sync-candidate peers whose pipelines have dropped
+// below minInFlightPerPeer.  Back-pressure: if the reorder buffer is at
+// or above reorderBufferCap, no new chunks are assigned until the chain
+// advancer drains it.  Stalled peers (no delivery within
+// peerAssignmentTimeout of their last assignment) have their in-flight
+// entries dropped from the global dedup map so other peers can pick up
+// those heights.
+//
+// MUST be called from the blockHandler goroutine.
+func (sm *SyncManager) scheduleParallelFetch() {
+	if !sm.ibdMode {
+		return
+	}
+
+	// Back-pressure: if the reorder buffer is full, stop fetching until
+	// drainOrderedBlocks makes room.
+	if len(sm.orderedBlocks) >= reorderBufferCap {
+		return
+	}
+
+	// Reclaim stalled peers' in-flight entries first so the assignment
+	// loop below has a chance to give those heights to a live peer.
+	sm.reclaimStalledAssignments()
+
+	// Two passes: assign to established (proven fast) peers FIRST so
+	// they soak up the buffer head-room, then fall back to unproven
+	// peers with whatever is left.  Map iteration order is random,
+	// which would otherwise spread chunks haphazardly and let slow
+	// peers grab the heights nearest orderedNext — exactly the worst
+	// case for the chain advancer.
+	for pass := 0; pass < 2; pass++ {
+		for peer, state := range sm.peerStates {
+			isEstablished := state.successfulDeliveries >=
+				establishedPeerThreshold
+			if pass == 0 && !isEstablished {
+				continue
+			}
+			if pass == 1 && isEstablished {
+				continue
+			}
+
+			if !state.syncCandidate {
+				continue
+			}
+			if len(state.requestedBlocks) >= minInFlightPerPeer {
+				continue
+			}
+
+			bestSnap := sm.chain.BestSnapshot()
+			if peer.LastBlock() <= bestSnap.Height {
+				continue
+			}
+
+			// Bail early if the buffer filled up partway through.
+			if len(sm.orderedBlocks) >= reorderBufferCap {
+				return
+			}
+			// Established peers get 2× the chunk so they carry
+			// more of the load.  Unproven peers stay on the
+			// small chunk so a slow one blocks at most that many
+			// heights before reassignment.
+			chunkSize := assignChunkSize
+			if isEstablished {
+				chunkSize *= 2
+			}
+			sm.assignBlocksToPeer(peer, state, chunkSize)
+		}
+	}
+}
+
+// reclaimStalledAssignments drops in-flight markers and disconnects
+// peers that have not delivered any block in peerAssignmentTimeout
+// despite having outstanding work.  Freed heights become candidates
+// for the next scheduler pass; the peer disconnection causes connmgr
+// to dial a replacement.  Bitcoin Core takes the same approach
+// during IBD — keeping a slow peer connected just delays the chain
+// for every other in-flight download.
+//
+// Caller-side back-stop: we only disconnect when there are other
+// peers available so that we don't end up with zero outbound capacity
+// when the last peer happens to be slow.
+func (sm *SyncManager) reclaimStalledAssignments() {
+	now := time.Now()
+	cutoff := now.Add(-peerAssignmentTimeout)
+	// Established peers get a 10× longer leash (5 min vs 30 s).  In
+	// practice this is "almost never disconnect" — only triggers if
+	// the peer has genuinely gone dead (TCP still up, but no data
+	// flow for 5 full minutes).  The intuition: IDC-grade peers are
+	// rare in the address pool, so once we've found one and verified
+	// it can deliver, churning back to the unknown majority is a
+	// terrible trade.  Bitcoin Core uses the same protected-outbound
+	// pattern.
+	establishedCutoff := now.Add(-peerAssignmentTimeout * 10)
+
+	for peer, state := range sm.peerStates {
+		if len(state.requestedBlocks) == 0 {
+			continue
+		}
+		if state.lastBlockActivity.IsZero() {
+			continue
+		}
+		threshold := cutoff
+		if state.successfulDeliveries >= establishedPeerThreshold {
+			threshold = establishedCutoff
+		}
+		if state.lastBlockActivity.After(threshold) {
+			continue
+		}
+
+		log.Infof("Peer %s stalled with %d blocks in-flight "+
+			"(no activity in >%v, deliveries=%d) -- freeing "+
+			"and disconnecting", peer,
+			len(state.requestedBlocks),
+			now.Sub(state.lastBlockActivity).Round(time.Second),
+			state.successfulDeliveries)
+		for hash := range state.requestedBlocks {
+			delete(sm.requestedBlocks, hash)
+		}
+		// Empty the per-peer set too so subsequent ticks don't
+		// re-fire this branch before handleDonePeerMsg arrives via
+		// the async disconnect notification.
+		state.requestedBlocks = make(map[chainhash.Hash]struct{})
+		if len(sm.peerStates) > 1 {
+			peer.Disconnect()
+		}
+	}
+}
+
+// checkHeadOfLineStall reacts when the next-needed block (orderedNext)
+// has been outstanding longer than headOfLineTimeout.  Instead of
+// disconnecting the holder, it issues a *duplicate* getdata to one
+// other healthy peer — first delivery wins, the slow peer is allowed
+// to keep working its other in-flight blocks (the general
+// peerAssignmentTimeout still catches truly dead peers).  This trades
+// a small amount of duplicate bandwidth for eliminating the
+// stop-and-go pattern that dominates throughput when peer block
+// delivery latency is variable.
+//
+// MUST be called from the blockHandler goroutine.
+func (sm *SyncManager) checkHeadOfLineStall() {
+	if !sm.ibdMode || sm.orderedNext == 0 {
+		return
+	}
+	if sm.orderedNextSince.IsZero() {
+		return
+	}
+	if time.Since(sm.orderedNextSince) < headOfLineTimeout {
+		return
+	}
+	if len(sm.peerStates) <= 1 {
+		return
+	}
+
+	sm.trySpeculativeFetch(sm.orderedNext)
+
+	// Reset the timer so we space out speculative re-requests by at
+	// least headOfLineTimeout — without this we'd hammer every peer
+	// every tick while stalled.
+	sm.orderedNextSince = time.Now()
+}
+
+// trySpeculativeFetch issues a duplicate getdata for the given height
+// to any single sync-candidate peer that doesn't already have it in
+// flight and is at or past that height.  The hash is added to the new
+// peer's state.requestedBlocks so handleBlockMsg's "did we ask?"
+// check accepts the duplicate delivery; the global sm.requestedBlocks
+// already lists the hash from the original request.
+//
+// Speculative duplicates are how we keep the chain advancer fed when
+// a single peer happens to be slow on a specific block — sending the
+// same getdata to a second peer turns "5 s wait then disconnect" into
+// "first to deliver wins, no wait."
+//
+// MUST be called from the blockHandler goroutine.
+func (sm *SyncManager) trySpeculativeFetch(height int32) {
+	hash, err := sm.chain.HeaderHashByHeight(height)
+	if err != nil {
+		return
+	}
+
+	// Don't re-ask the peer that already has it.
+	currentHolder := sm.findPeerWithHeight(height)
+
+	for peer, state := range sm.peerStates {
+		if peer == currentHolder {
+			continue
+		}
+		if !state.syncCandidate {
+			continue
+		}
+		if peer.LastBlock() < height {
+			continue
+		}
+		if _, exists := state.requestedBlocks[*hash]; exists {
+			// Already speculatively requested from this peer.
+			continue
+		}
+
+		iv := wire.NewInvVect(wire.InvTypeBlock, hash)
+		if peer.IsWitnessEnabled() {
+			iv.Type = wire.InvTypeWitnessBlock
+		}
+		gdmsg := wire.NewMsgGetData()
+		gdmsg.AddInvVect(iv)
+		peer.QueueMessage(gdmsg, nil)
+
+		// Mark this peer as carrying the block too.  Don't touch
+		// sm.requestedBlocks (already lists the hash) — only the
+		// per-peer set, so handleBlockMsg accepts the delivery from
+		// this peer without disconnecting it as "unrequested".
+		state.requestedBlocks[*hash] = struct{}{}
+
+		log.Infof("Speculative re-request of head-of-line block "+
+			"%d issued to peer %s (original holder=%v)",
+			height, peer.Addr(), currentHolder)
+		return
+	}
+}
+
+// findPeerWithHeight returns the peer that currently has the block
+// hash at the given height marked as in-flight in its per-peer
+// requestedBlocks map, or nil if no peer has it.  O(peers) — fine for
+// IBD with a handful of outbound connections.
+func (sm *SyncManager) findPeerWithHeight(height int32) *peerpkg.Peer {
+	hash, err := sm.chain.HeaderHashByHeight(height)
+	if err != nil {
+		return nil
+	}
+	for peer, state := range sm.peerStates {
+		if _, ok := state.requestedBlocks[*hash]; ok {
+			return peer
+		}
+	}
+	return nil
+}
+
+// assignBlocksToPeer asks a single peer to fetch up to maxBlocks blocks
+// from the unassigned portion of the still-missing header range.  Heights
+// already in flight (sm.requestedBlocks) or already buffered
+// (orderedBlocks) are skipped, so the work is naturally disjoint across
+// peers.  The look-ahead is capped at orderedNext + reorderBufferCap to
+// keep the buffer from being filled by a single fast peer beyond what
+// the chain advancer can drain.
+//
+// MUST be called from the blockHandler goroutine.
+func (sm *SyncManager) assignBlocksToPeer(peer *peerpkg.Peer,
+	state *peerSyncState, maxBlocks int) {
+
+	_, bestHeaderHeight := sm.chain.BestHeader()
+	start := sm.orderedNext
+	if start == 0 {
+		start = sm.chain.BestSnapshot().Height + 1
+	}
+
+	// Don't look further ahead than the buffer can hold.
+	horizon := start + int32(reorderBufferCap)
+	if horizon > bestHeaderHeight+1 {
+		horizon = bestHeaderHeight + 1
+	}
+
+	gdmsg := wire.NewMsgGetDataSizeHint(uint(maxBlocks))
+	for h := start; h < horizon && len(gdmsg.InvList) < maxBlocks; h++ {
+		hash, err := sm.chain.HeaderHashByHeight(h)
+		if err != nil {
+			// Header chain may have shifted under us; just stop
+			// this assignment attempt — next refill catches up.
+			return
+		}
+		if _, exists := sm.requestedBlocks[*hash]; exists {
+			continue
+		}
+		if _, exists := sm.orderedBlocks[h]; exists {
+			continue
+		}
+
+		iv := wire.NewInvVect(wire.InvTypeBlock, hash)
+		if peer.IsWitnessEnabled() {
+			iv.Type = wire.InvTypeWitnessBlock
+		}
+		gdmsg.AddInvVect(iv)
+
+		sm.requestedBlocks[*hash] = struct{}{}
+		state.requestedBlocks[*hash] = struct{}{}
+	}
+
+	if len(gdmsg.InvList) > 0 {
+		peer.QueueMessage(gdmsg, nil)
+		state.lastBlockActivity = time.Now()
+	}
+}
+
 // fetchHeaderBlocks creates and sends a request to the given peer for the next
 // list of blocks to be downloaded based on the current list of headers.
+// Kept for the non-parallel paths (startSync fallback, single-peer flows).
 func (sm *SyncManager) fetchHeaderBlocks(peer *peerpkg.Peer) {
 	if peer == nil {
 		log.Warnf("fetchHeaderBlocks called with a nil peer")
@@ -975,9 +1451,10 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
 			blockHeader, blockchain.BFNone, false,
 		)
 		if err != nil {
-			log.Warnf("Received block header from peer %v "+
-				"failed header verification -- disconnecting",
-				peer.Addr())
+			log.Warnf("Received block header %v from peer %v "+
+				"failed header verification: %v -- "+
+				"disconnecting", blockHeader.BlockHash(),
+				peer.Addr(), err)
 			peer.Disconnect()
 			return
 		}
@@ -1009,7 +1486,7 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
 	log.Infof("downloaded headers to %v(%v) from peer %v "+
 		"-- now fetching blocks",
 		bestHeaderHash, bestHeaderHeight, hmsg.peer.String())
-	sm.fetchHeaderBlocks(peer)
+	sm.scheduleParallelFetch()
 }
 
 // handleNotFoundMsg handles notfound messages from all peers.
@@ -1302,6 +1779,9 @@ func (sm *SyncManager) blockHandler() {
 	stallTicker := time.NewTicker(stallSampleInterval)
 	defer stallTicker.Stop()
 
+	ibdScheduleTicker := time.NewTicker(ibdScheduleInterval)
+	defer ibdScheduleTicker.Stop()
+
 out:
 	for {
 		select {
@@ -1366,6 +1846,14 @@ out:
 
 		case <-stallTicker.C:
 			sm.handleStallSample()
+
+		case <-ibdScheduleTicker.C:
+			// Per-tick IBD maintenance.  Both are no-ops
+			// outside IBD.  Head-of-line first so freed work
+			// is available before scheduleParallelFetch
+			// re-distributes.
+			sm.checkHeadOfLineStall()
+			sm.scheduleParallelFetch()
 
 		case <-sm.quit:
 			break out
@@ -1564,6 +2052,16 @@ func (sm *SyncManager) Start() {
 	if atomic.AddInt32(&sm.started, 1) != 1 {
 		return
 	}
+
+	// Conservatively assume IBD until startSync has had a chance to
+	// evaluate peer heights.  Without this, a brief window between
+	// blockHandler launch and the first startSync call lets peer inv
+	// announcements through while sm.syncPeer is still nil and the
+	// chain looks "current" by its 24-hour timestamp heuristic — the
+	// resulting getdata requests produce chains of orphan blocks that
+	// each spawn more PushGetBlocksMsg traffic.  startSync clears this
+	// once it confirms we are actually caught up to the network.
+	sm.ibdMode = true
 
 	log.Trace("Starting sync manager")
 	sm.wg.Add(1)

@@ -51,8 +51,17 @@ const (
 	// required to be supported by outbound peers.
 	defaultRequiredServices = wire.SFNodeNetwork
 
-	// defaultTargetOutbound is the default number of outbound peers to target.
-	defaultTargetOutbound = 8
+	// defaultTargetOutbound is the default number of outbound peers to
+	// target.  Raised from the historical 8 to 24 so the parallel
+	// block fetch scheduler has enough independent download links
+	// without overloading consumer Wi-Fi routers — empirically,
+	// home-grade routers start dropping TCP connections (SPI table
+	// overflow / NAT connection-state exhaustion) around 50+
+	// simultaneous outbound flows, which causes a cascade of peer
+	// connect/disconnect churn that leaves the network at near-zero
+	// throughput.  24 is well below that threshold while still
+	// 3x more parallelism than the upstream default.
+	defaultTargetOutbound = 24
 
 	// connectionRetryInterval is the base amount of time to wait in between
 	// retries when connecting to persistent peers.  It is adjusted by the
