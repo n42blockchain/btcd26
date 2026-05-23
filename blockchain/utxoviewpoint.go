@@ -584,16 +584,25 @@ func (view *UtxoViewpoint) findInputsToFetch(block *btcutil.Block) []wire.OutPoi
 	// Build a map of in-flight transactions because some of the inputs in
 	// this block could be referencing other transactions earlier in this
 	// block which are not yet in the chain.
-	txInFlight := map[chainhash.Hash]int{}
 	transactions := block.Transactions()
+	txInFlight := make(map[chainhash.Hash]int, len(transactions))
 	for i, tx := range transactions {
 		txInFlight[*tx.Hash()] = i
+	}
+
+	// Pre-size the "needed" slice for the worst case — sum of all
+	// inputs across non-coinbase transactions.  The prior cap of
+	// len(transactions) was off by ~3× (mainnet averages ~3 inputs
+	// per tx), so the slice rebalanced once or twice per block.
+	totalInputs := 0
+	for _, tx := range transactions[1:] {
+		totalInputs += len(tx.MsgTx().TxIn)
 	}
 
 	// Loop through all of the transaction inputs (except for the coinbase
 	// which has no inputs) collecting them into sets of what is needed and
 	// what is already known (in-flight).
-	needed := make([]wire.OutPoint, 0, len(transactions))
+	needed := make([]wire.OutPoint, 0, totalInputs)
 	for i, tx := range transactions[1:] {
 		for _, txIn := range tx.MsgTx().TxIn {
 			// It is acceptable for a transaction input to reference
