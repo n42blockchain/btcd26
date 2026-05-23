@@ -878,9 +878,23 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockMsg) {
 			sm.scheduleParallelFetch()
 			return
 		}
-		// Header height lookup failed (block's header not yet in our
-		// index — shouldn't happen since IBD waits for headers first).
-		// Fall through to direct apply as a safety net.
+		// Header height lookup failed.  In IBD this means the block
+		// raced ahead of the header download (parallel-fetch races
+		// with handleHeadersMsg) or a peer relayed an unsolicited
+		// recent-tip block.  Either way we MUST NOT fall through to
+		// applyBlock — it would call ProcessBlock and add the block
+		// to the orphan pool, which under heavy IBD parallel fetch
+		// produces tens of thousands of orphans whose parents are
+		// hundreds of thousands of heights ahead of our tip, jamming
+		// the blockHandler goroutine and starving header download.
+		// Dropping is safe: once we finish downloading the header
+		// for this block, the chain advancer will reach it through
+		// the normal orderedBlocks path and request it again if
+		// needed (the assignBlocksToPeer cursor walks header heights
+		// in order, so the gap fills in deterministically).
+		log.Debugf("Dropping block %v from peer %s in IBD: header "+
+			"not yet known", blockHash, peer.Addr())
+		return
 	}
 
 	sm.applyBlock(bmsg)
