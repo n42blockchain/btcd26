@@ -59,3 +59,8 @@ coverage.txt.bak
 
 # Test fixture databases - regenerated at test time
 blockchain/testdbs/
+
+# Local-only Go workspace (lets root module pick up uncommitted
+# submodule edits during development).  Should not land upstream.
+go.work
+go.work.sum
