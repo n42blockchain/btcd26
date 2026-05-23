@@ -444,6 +444,34 @@ type Tx interface {
 	Rollback() error
 }
 
+// BlockFileLocator is an optional capability some Tx implementations
+// expose alongside the core block storage methods.  When a driver
+// stores blocks in numbered append-only files, the methods below let
+// callers express prune policies in terms of file boundaries —
+// e.g. "delete every file fully below the latest checkpoint" — which
+// the byte-size-only PruneBlocks API cannot.
+//
+// Drivers that do not segment storage into discrete files (or do not
+// expose the layout) need not implement this interface; callers should
+// type-assert at the call site and fall back when the assertion fails.
+type BlockFileLocator interface {
+	// BlockFileNum returns the file number that currently stores the
+	// block with the provided hash.  Returns ErrBlockNotFound when the
+	// hash is unknown to the index.  When the block is held in a
+	// non-prunable backing store (e.g. a cold segment), implementations
+	// return math.MaxUint32 to signal "not in a hot file."
+	BlockFileNum(hash *chainhash.Hash) (uint32, error)
+
+	// PruneBlockFilesBefore deletes every hot block file with number
+	// strictly less than keepFromFileNum and removes the corresponding
+	// rows from the block index.  Returns the hashes of every block
+	// whose index row was dropped, in implementation-defined order.
+	//
+	// The operation is a no-op (returns nil, nil) when no hot file
+	// number is below keepFromFileNum.
+	PruneBlockFilesBefore(keepFromFileNum uint32) ([]chainhash.Hash, error)
+}
+
 // DB provides a generic interface that is used to store bitcoin blocks and
 // related metadata.  This interface is intended to be agnostic to the actual
 // mechanism used for backend data storage.  The RegisterDriver function can be

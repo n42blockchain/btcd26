@@ -1063,6 +1063,15 @@ func (sm *SyncManager) applyBlock(bmsg *blockMsg) {
 			"caught up to block %v(%v) -- now listening to blocks.",
 			bmsg.block.Hash(), bmsg.block.Height())
 		sm.ibdMode = false
+
+		// Now that we are past the last checkpoint, give the chain
+		// a chance to drop pre-checkpoint block bodies if the
+		// --prunetocheckpoint flag is set.  The call is a cheap
+		// no-op when the flag is off or when the prune has already
+		// run in this process.
+		if err := sm.chain.MaybePruneToLatestCheckpoint(); err != nil {
+			log.Warnf("MaybePruneToLatestCheckpoint: %v", err)
+		}
 	}
 }
 

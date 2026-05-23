@@ -119,6 +119,17 @@ type BlockChain struct {
 	// is pruned.
 	pruneTarget uint64
 
+	// pruneToCheckpoint, when true, enables a one-shot prune that
+	// deletes every block file fully below the most recent hard-coded
+	// checkpoint.  Owned by MaybePruneToLatestCheckpoint, which is
+	// idempotent once the prune has run.
+	pruneToCheckpoint bool
+
+	// pruneToCheckpointDone is set once MaybePruneToLatestCheckpoint
+	// has successfully executed in this process so that subsequent
+	// calls are cheap no-ops.  Guarded by chainLock.
+	pruneToCheckpointDone bool
+
 	// These fields are related to the memory block index.  They both have
 	// their own locks, however they are often also protected by the chain
 	// lock to help prevent logic races when blocks are being processed.
@@ -1382,6 +1393,104 @@ func (b *BlockChain) IsCurrent() bool {
 	return b.isCurrent()
 }
 
+// MaybePruneToLatestCheckpoint deletes every block file whose contents
+// sit entirely below the most recent hard-coded checkpoint, retaining
+// only the block index entries (headers) for those heights.  After it
+// runs, the node still verifies the full chain via the surviving
+// headers but no longer holds the raw block bytes for pre-checkpoint
+// blocks, which is the bulk of the on-disk footprint.
+//
+// Preconditions enforced internally:
+//   - pruneToCheckpoint was set in the chain config; otherwise no-op.
+//   - The chain has caught up past the checkpoint; otherwise no-op.
+//   - The database driver implements database.BlockFileLocator;
+//     otherwise an error is returned (mdbxdb does; legacy ffldb
+//     does not currently expose the layout).
+//   - This is the first successful call in the current process; the
+//     operation is idempotent and a second invocation is a no-op.
+//
+// Concurrency: takes the chainLock for writing for the duration of the
+// prune transaction.  Block processing is blocked until it returns;
+// the operation finishes in well under a second on mainnet because it
+// only deletes whole files and a bounded slice of index rows.
+func (b *BlockChain) MaybePruneToLatestCheckpoint() error {
+	if !b.pruneToCheckpoint {
+		return nil
+	}
+
+	b.chainLock.Lock()
+	defer b.chainLock.Unlock()
+
+	if b.pruneToCheckpointDone {
+		return nil
+	}
+
+	cp := b.LatestCheckpoint()
+	if cp == nil {
+		// No checkpoints defined for this network (regtest, simnet).
+		// Mark done so we don't reprobe on every IBD-complete tick.
+		b.pruneToCheckpointDone = true
+		return nil
+	}
+
+	tipHeight := b.bestChain.Tip().height
+	if tipHeight <= cp.Height {
+		// Not yet past the checkpoint; try again later.
+		return nil
+	}
+
+	var deletedCount int
+	err := b.db.Update(func(dbTx database.Tx) error {
+		locator, ok := dbTx.(database.BlockFileLocator)
+		if !ok {
+			return fmt.Errorf("MaybePruneToLatestCheckpoint: " +
+				"database driver does not implement " +
+				"BlockFileLocator; cannot prune by file " +
+				"boundary")
+		}
+
+		cpFileNum, err := locator.BlockFileNum(cp.Hash)
+		if err != nil {
+			return fmt.Errorf("looking up checkpoint block "+
+				"file: %w", err)
+		}
+		if cpFileNum == ^uint32(0) {
+			// Checkpoint already in cold storage — pre-checkpoint
+			// .fdb files were either previously pruned or migrated.
+			return nil
+		}
+		if cpFileNum == 0 {
+			// Checkpoint sits in the very first file; nothing to
+			// delete below it.
+			return nil
+		}
+
+		deleted, err := locator.PruneBlockFilesBefore(cpFileNum)
+		if err != nil {
+			return fmt.Errorf("PruneBlockFilesBefore(%d): %w",
+				cpFileNum, err)
+		}
+		deletedCount = len(deleted)
+
+		// Spend-journal rows for pre-checkpoint blocks were already
+		// skipped at write time (see connectBlock skipUndo), so the
+		// only adjacent bucket to clean up is the block-index entry
+		// itself which PruneBlockFilesBefore already handled.
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+
+	if deletedCount > 0 {
+		log.Infof("Pruned %d pre-checkpoint blocks (block files "+
+			"below #%d) — kept headers, removed block bodies",
+			deletedCount, cp.Height)
+	}
+	b.pruneToCheckpointDone = true
+	return nil
+}
+
 // BestSnapshot returns information about the current best chain block and
 // related state as of the current point in time.  The returned instance must be
 // treated as immutable since it is shared by all callers.
@@ -2267,6 +2376,13 @@ type Config struct {
 	// will target for with block files.  Prune at 0 specifies that no
 	// blocks will be deleted.
 	Prune uint64
+
+	// PruneToCheckpoint enables a one-shot prune that drops every block
+	// file fully below the most recent hard-coded checkpoint.  Headers
+	// remain in the block index so the chain still verifies, but the
+	// raw block bytes for pre-checkpoint heights are deleted.  Triggered
+	// by MaybePruneToLatestCheckpoint once the chain is current.
+	PruneToCheckpoint bool
 }
 
 // New returns a BlockChain instance using the provided configuration details.
@@ -2325,6 +2441,7 @@ func New(config *Config) (*BlockChain, error) {
 		warningCaches:       newThresholdCaches(vbNumBits),
 		deploymentCaches:    newThresholdCaches(chaincfg.DefinedDeployments),
 		pruneTarget:         config.Prune,
+		pruneToCheckpoint:   config.PruneToCheckpoint,
 	}
 
 	// Ensure all the deployments are synchronized with our clock if

@@ -153,6 +153,7 @@ type config struct {
 	ProxyPass            string        `long:"proxypass" default-mask:"-" description:"Password for proxy server"`
 	ProxyUser            string        `long:"proxyuser" description:"Username for proxy server"`
 	Prune                uint64        `long:"prune" description:"Prune already validated blocks from the database. Must specify a target size in MiB (minimum value of 1536, default value of 0 will disable pruning)"`
+	PruneToCheckpoint    bool          `long:"prunetocheckpoint" description:"Delete on-disk block data for every block file fully below the most recent hard-coded checkpoint. Headers stay in the index so the chain still verifies; pruned blocks become unservable via RPC and P2P. Cannot be combined with --prune."`
 	RegressionTest       bool          `long:"regtest" description:"Use the regression test network"`
 	RejectNonStd         bool          `long:"rejectnonstd" description:"Reject non-standard transactions regardless of the default settings for the active network."`
 	RejectReplacement    bool          `long:"rejectreplacement" description:"Reject transactions that attempt to replace existing transactions within the mempool through the Replace-By-Fee (RBF) signaling policy."`
@@ -1166,6 +1167,23 @@ func loadConfig() (*config, []string, error) {
 	if cfg.Prune != 0 && cfg.AddrIndex {
 		err := fmt.Errorf("%s: the --prune and --addrindex options may "+
 			"not be activated at the same time", funcName)
+		fmt.Fprintln(os.Stderr, err)
+		fmt.Fprintln(os.Stderr, usageMessage)
+		return nil, nil, err
+	}
+
+	if cfg.PruneToCheckpoint && cfg.Prune != 0 {
+		err := fmt.Errorf("%s: --prunetocheckpoint cannot be combined "+
+			"with --prune", funcName)
+		fmt.Fprintln(os.Stderr, err)
+		fmt.Fprintln(os.Stderr, usageMessage)
+		return nil, nil, err
+	}
+
+	if cfg.PruneToCheckpoint && (cfg.TxIndex || cfg.AddrIndex) {
+		err := fmt.Errorf("%s: --prunetocheckpoint cannot be combined "+
+			"with --txindex or --addrindex (indexers require block "+
+			"data we are about to delete)", funcName)
 		fmt.Fprintln(os.Stderr, err)
 		fmt.Fprintln(os.Stderr, usageMessage)
 		return nil, nil, err

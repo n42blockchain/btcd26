@@ -229,6 +229,109 @@ func (tx *transaction) FetchBlock(hash *chainhash.Hash) ([]byte, error) {
 	return tx.db.store.readBlock(hash, loc)
 }
 
+// BlockFileNum returns the .fdb file number that currently holds the
+// block with the supplied hash.  It satisfies the database.BlockFileLocator
+// optional interface so chain code can express prune policies in terms
+// of file boundaries (e.g. "delete every file whose contents are
+// entirely below the latest checkpoint") without depending on this
+// driver's private types.
+//
+// For blocks resident in cold (zstd-segmented) storage the cold-segment
+// bit is stripped before returning so callers see a contiguous-looking
+// fileNum space.  This is consistent with how PruneBlocks scans the
+// hot directory.
+func (tx *transaction) BlockFileNum(hash *chainhash.Hash) (uint32, error) {
+	if err := tx.checkClosed(); err != nil {
+		return 0, err
+	}
+	if idx, ok := tx.pendingBlocks[*hash]; ok {
+		// Pending writes always land in the current hot file.
+		_ = idx
+		return tx.db.store.writeCursor.curFileNum, nil
+	}
+	row, err := tx.fetchBlockRow(hash)
+	if err != nil {
+		return 0, err
+	}
+	loc := deserializeBlockLoc(row)
+	if isColdLocation(loc) {
+		// Cold-stored blocks live in .seg files outside the .fdb
+		// numbering space; signal "not in a prunable hot file" via
+		// the sentinel max value so the chain-level pruner can
+		// distinguish and bail out cleanly.
+		return ^uint32(0), nil
+	}
+	return loc.blockFileNum, nil
+}
+
+// PruneBlockFilesBefore deletes every .fdb file with number strictly
+// less than keepFromFileNum and drops the corresponding rows from the
+// block index in the same transaction.  Returns the hashes of all
+// blocks whose index rows were dropped.
+//
+// It mirrors PruneBlocks's two-phase structure (mark files for delete
+// then sweep the block-index cursor) but bounds the delete set by file
+// number rather than by total on-disk byte budget.  Block files whose
+// fileNum >= keepFromFileNum are untouched, so the file containing the
+// checkpoint block (and everything newer) survives.
+func (tx *transaction) PruneBlockFilesBefore(
+	keepFromFileNum uint32) ([]chainhash.Hash, error) {
+
+	if err := tx.checkClosed(); err != nil {
+		return nil, err
+	}
+	if !tx.writable {
+		return nil, makeDbErr(database.ErrTxNotWritable,
+			"prune blocks requires a writable database "+
+				"transaction", nil)
+	}
+
+	first, last, _, err := scanBlockFiles(tx.db.store.basePath)
+	if err != nil {
+		return nil, err
+	}
+
+	// scanBlockFiles uses 'last' as the file currently being written,
+	// which we never delete.  All files with number < keepFromFileNum
+	// AND < last are candidates.
+	upper := keepFromFileNum
+	if uint32(last) < upper {
+		upper = uint32(last)
+	}
+	if uint32(first) >= upper {
+		return nil, nil
+	}
+
+	deletedFiles := make(map[uint32]struct{}, upper-uint32(first))
+	for i := uint32(first); i < upper; i++ {
+		if tx.pendingDelFileNums == nil {
+			tx.pendingDelFileNums = make([]uint32, 0,
+				upper-uint32(first))
+		}
+		tx.pendingDelFileNums = append(tx.pendingDelFileNums, i)
+		deletedFiles[i] = struct{}{}
+	}
+
+	var deletedBlockHashes []chainhash.Hash
+	cursor := tx.blockIdxBucket.Cursor()
+	for ok := cursor.First(); ok; ok = cursor.Next() {
+		loc := deserializeBlockLoc(cursor.Value())
+		if isColdLocation(loc) {
+			continue
+		}
+		if _, found := deletedFiles[loc.blockFileNum]; !found {
+			continue
+		}
+		var h chainhash.Hash
+		copy(h[:], cursor.Key())
+		deletedBlockHashes = append(deletedBlockHashes, h)
+		if err := cursor.Delete(); err != nil {
+			return nil, err
+		}
+	}
+	return deletedBlockHashes, nil
+}
+
 func (tx *transaction) FetchBlocks(hashes []chainhash.Hash) ([][]byte, error) {
 	if err := tx.checkClosed(); err != nil {
 		return nil, err

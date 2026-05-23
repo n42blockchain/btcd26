@@ -2392,6 +2392,17 @@ func (s *server) peerHandler() {
 	s.addrManager.Start()
 	s.syncManager.Start()
 
+	// If --prunetocheckpoint was passed and we are restarting a node
+	// whose chain already advanced past the latest checkpoint, the
+	// netsync IBD-complete hook will never fire on this run.  Probe
+	// the chain once at boot so the prune still happens.  The call
+	// is a no-op when the flag is off, when checkpoints are not yet
+	// reached, or when the prune has already run.
+	if err := s.chain.MaybePruneToLatestCheckpoint(); err != nil {
+		srvrLog.Warnf("MaybePruneToLatestCheckpoint at "+
+			"startup: %v", err)
+	}
+
 	srvrLog.Tracef("Starting peer handler")
 
 	state := &peerState{
@@ -2885,6 +2896,15 @@ func newServer(listenAddrs, agentBlacklist, agentWhitelist []string,
 	if cfg.Prune != 0 {
 		services &^= wire.SFNodeNetwork
 	}
+	if cfg.PruneToCheckpoint {
+		// We retain block data for every height after the most recent
+		// hard-coded checkpoint, which is far more than BIP159's
+		// 288-block lower bound for NODE_NETWORK_LIMITED, but we
+		// cannot serve historical pre-checkpoint blocks.  Drop the
+		// NODE_NETWORK bit so peers correctly classify us as a
+		// limited-history node.
+		services &^= wire.SFNodeNetwork
+	}
 	if !cfg.V2Transport {
 		services &^= wire.SFNodeP2PV2
 	}
@@ -2998,8 +3018,9 @@ func newServer(listenAddrs, agentBlacklist, agentWhitelist []string,
 		SigCache:         s.sigCache,
 		IndexManager:     indexManager,
 		HashCache:        s.hashCache,
-		Prune:            cfg.Prune * 1024 * 1024,
-		UtxoCacheMaxSize: uint64(cfg.UtxoCacheMaxSizeMiB) * 1024 * 1024,
+		Prune:             cfg.Prune * 1024 * 1024,
+		PruneToCheckpoint: cfg.PruneToCheckpoint,
+		UtxoCacheMaxSize:  uint64(cfg.UtxoCacheMaxSizeMiB) * 1024 * 1024,
 	})
 	if err != nil {
 		return nil, err
