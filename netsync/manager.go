@@ -829,8 +829,18 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockMsg) {
 	// Remove block from request maps. Either chain will know about it and
 	// so we shouldn't have any more instances of trying to fetch it, or we
 	// will fail the insert and thus we'll retry next time we get an inv.
-	// Note we delete from *every* peer's per-peer set because a
-	// speculative request may have left the hash in multiple peers.
+	//
+	// Dual-map invariant (sm.requestedBlocks vs state.requestedBlocks):
+	// the global map dedups across peers to avoid duplicate getdata; the
+	// per-peer map authorises a delivery from that specific peer.  A
+	// speculative re-request (trySpeculativeFetch) intentionally inserts
+	// the same hash into a SECOND peer's state.requestedBlocks while
+	// leaving the global map untouched, so whichever peer wins delivers
+	// it and the rest's per-peer entries get cleaned up here.  This
+	// reliance on iterating every peer's map is only safe because all
+	// SyncManager operations run on the single blockHandler goroutine;
+	// any future refactor that introduces parallel handlers must
+	// re-think the locking.
 	for _, st := range sm.peerStates {
 		delete(st.requestedBlocks, *blockHash)
 	}
@@ -885,10 +895,18 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockMsg) {
 //
 // MUST be called from the blockHandler goroutine.
 func (sm *SyncManager) drainOrderedBlocks() {
-	for sm.ibdMode {
+	// Drain consecutive blocks unconditionally: the buffered blocks
+	// were already paid for (peer requestedBlocks check + per-peer
+	// pipeline accounting) and are at heights the scheduler vetted
+	// against bestHeader.  If applyBlock flips ibdMode off partway
+	// through, the remaining buffered blocks are still valid and
+	// should be applied — the old "discard the rest" path leaked
+	// the work and could stall the chain at the IBD→steady-state
+	// boundary if the peer never re-announced them.
+	for {
 		bmsg, ok := sm.orderedBlocks[sm.orderedNext]
 		if !ok {
-			return
+			break
 		}
 		delete(sm.orderedBlocks, sm.orderedNext)
 		sm.orderedNext++
@@ -897,10 +915,10 @@ func (sm *SyncManager) drainOrderedBlocks() {
 		sm.applyBlock(bmsg)
 	}
 
-	// IBD transitioned off inside applyBlock — discard any blocks left in
-	// the buffer.  They are at heights past the new tip and will arrive
-	// again via the normal inv flow if/when needed.
-	if !sm.ibdMode {
+	// Past the IBD→steady-state transition the reorder buffer is
+	// useless (handleBlockMsg routes single-block deliveries
+	// directly).  Clear it to release the map allocation.
+	if !sm.ibdMode && sm.orderedBlocks != nil {
 		sm.orderedBlocks = nil
 		sm.orderedNext = 0
 		sm.orderedNextSince = time.Time{}

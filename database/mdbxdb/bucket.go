@@ -252,8 +252,16 @@ func (b *bucket) Writable() bool { return b.tx.writable }
 // Put stores a key/value pair, applying the configured codec on value.
 // Uses pooled scratch buffers for both the encoded value and the
 // bucketized key so the steady-state hot path avoids per-call
-// allocation — mdbx copies both into tree pages before this returns,
-// so the buffers are safe to recycle on the next Put.
+// allocation.
+//
+// Pool lifetime invariant: mdbx_put() is documented to copy both key
+// and value bytes into the btree page synchronously before returning
+// to the caller (the MDBX_RESERVE flag is the documented exception
+// and we never use it).  Therefore both pool buffers are safe to
+// recycle on the next Put.  See mdbx-go/mdbx/txn.go Put().  If a
+// future change introduces MDBX_RESERVE in this path the pool
+// recycling must be re-evaluated; the C-side pointer would remain
+// valid only until the transaction commits.
 func (b *bucket) Put(key, value []byte) error {
 	if err := b.tx.checkClosed(); err != nil {
 		return err
@@ -358,6 +366,14 @@ func (b *bucket) PutBatch(pairs []database.KVPair) error {
 // encodeChunkParallel fans codec.Encode across runtime.NumCPU workers,
 // writing results into out[i] for each pairs[i].  Returns the first
 // encode error if any worker fails.
+//
+// Thread-safety: out[] is shared across workers but each worker is
+// assigned a disjoint [from, to) sub-range and only writes to its
+// own indices.  No reads happen until wg.Wait() returns.  The
+// backing array is never re-sliced or resized during the fan-out, so
+// concurrent writes to disjoint indices are safe per the Go memory
+// model.  Do NOT add logging or other intermediate reads of out[]
+// inside the worker goroutines.
 func (b *bucket) encodeChunkParallel(codec Codec,
 	pairs []database.KVPair, out [][]byte) error {
 

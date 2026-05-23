@@ -746,6 +746,19 @@ func (b *BlockChain) disconnectBlock(node *blockNode, block *btcutil.Block, view
 			"block at the end of the main chain")
 	}
 
+	// Pre-checkpoint blocks have no spend journal entry (connectBlock
+	// skips dbPutSpendJournalEntry for them — see "skipUndo" rationale
+	// there) so they cannot be unwound.  CheckBlockHeaderContext
+	// already refuses any chain whose disagreement point predates the
+	// last hard-coded checkpoint, so reaching this with such a node
+	// indicates either (a) checkpoints were edited without a re-sync
+	// or (b) a logic bug; either way it is unsafe to continue.
+	if cp := b.LatestCheckpoint(); cp != nil && node.height <= cp.Height {
+		return AssertError(fmt.Sprintf("disconnectBlock called for "+
+			"pre-checkpoint height %d (<=%d); undo data was not "+
+			"persisted", node.height, cp.Height))
+	}
+
 	// Load the previous block since some details for it are needed below.
 	prevNode := node.parent
 	var prevBlock *btcutil.Block
