@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"math"
 	"runtime"
+	"sync"
 	"time"
 
 	"github.com/btcsuite/btcd/btcutil/v2"
@@ -23,154 +24,204 @@ type txValidateItem struct {
 	sigHashes *txscript.TxSigHashes
 }
 
-// txValidator provides a type which asynchronously validates transaction
-// inputs.  It provides several channels for communication and a processing
-// function that is intended to be in run multiple goroutines.
-type txValidator struct {
-	validateChan chan *txValidateItem
-	quitChan     chan struct{}
-	resultChan   chan error
-	utxoView     *UtxoViewpoint
-	flags        txscript.ScriptFlags
-	sigCache     *txscript.SigCache
-	hashCache    *txscript.HashCache
+// scriptValidateJob is the per-input work unit dispatched to a worker in
+// scriptValidatorPool.  Each job carries the per-call view/flags/cache
+// pointers so workers can run without referencing a per-block validator
+// struct.
+type scriptValidateJob struct {
+	item     *txValidateItem
+	utxoView *UtxoViewpoint
+	flags    txscript.ScriptFlags
+	sigCache *txscript.SigCache
+	resultCh chan<- error
+	cancel   <-chan struct{}
 }
 
-// sendResult sends the result of a script pair validation on the internal
-// result channel while respecting the quit channel.  This allows orderly
-// shutdown when the validation process is aborted early due to a validation
-// error in one of the other goroutines.
-func (v *txValidator) sendResult(result error) {
-	select {
-	case v.resultChan <- result:
-	case <-v.quitChan:
-	}
+// scriptValidatorPool is a long-lived fan-out worker pool for script
+// verification.  It replaces the previous per-block goroutine spawn
+// pattern (NumCPU*3 goroutines created and torn down for every block
+// validated), which under IBD adds tens of millions of goroutine
+// lifecycles and synchronous channel handoffs to the critical path.
+//
+// One pool is shared across the process.  Multiple concurrent Validate
+// calls (e.g. mempool ingress racing block validation) are isolated
+// from each other via their own per-call resultCh / cancel channels;
+// the shared workCh just FIFO-dispatches their jobs.
+type scriptValidatorPool struct {
+	workCh chan scriptValidateJob
 }
 
-// validateHandler consumes items to validate from the internal validate channel
-// and returns the result of the validation on the internal result channel. It
-// must be run as a goroutine.
-func (v *txValidator) validateHandler() {
-out:
-	for {
-		select {
-		case txVI := <-v.validateChan:
-			// Ensure the referenced input utxo is available.
-			txIn := txVI.txIn
-			utxo := v.utxoView.LookupEntry(txIn.PreviousOutPoint)
-			if utxo == nil {
-				str := fmt.Sprintf("unable to find unspent "+
-					"output %v referenced from "+
-					"transaction %s:%d",
-					txIn.PreviousOutPoint, txVI.tx.Hash(),
-					txVI.txInIndex)
-				err := ruleError(ErrMissingTxOut, str)
-				v.sendResult(err)
-				break out
-			}
+var (
+	scriptValPool     *scriptValidatorPool
+	scriptValPoolOnce sync.Once
+)
 
-			// Create a new script engine for the script pair.
-			sigScript := txIn.SignatureScript
-			witness := txIn.Witness
-			pkScript := utxo.PkScript()
-			inputAmount := utxo.Amount()
-			vm, err := txscript.NewEngine(
-				pkScript, txVI.tx.MsgTx(), txVI.txInIndex,
-				v.flags, v.sigCache, txVI.sigHashes,
-				inputAmount, v.utxoView,
-			)
-			if err != nil {
-				str := fmt.Sprintf("failed to parse input "+
-					"%s:%d which references output %v - "+
-					"%v (input witness %x, input script "+
-					"bytes %x, prev output script bytes %x)",
-					txVI.tx.Hash(), txVI.txInIndex,
-					txIn.PreviousOutPoint, err, witness,
-					sigScript, pkScript)
-				err := ruleError(ErrScriptMalformed, str)
-				v.sendResult(err)
-				break out
-			}
-
-			// Execute the script pair.
-			if err := vm.Execute(); err != nil {
-				str := fmt.Sprintf("failed to validate input "+
-					"%s:%d which references output %v - "+
-					"%v (input witness %x, input script "+
-					"bytes %x, prev output script bytes %x)",
-					txVI.tx.Hash(), txVI.txInIndex,
-					txIn.PreviousOutPoint, err, witness,
-					sigScript, pkScript)
-				err := ruleError(ErrScriptValidation, str)
-				v.sendResult(err)
-				break out
-			}
-
-			// Validation succeeded.
-			v.sendResult(nil)
-
-		case <-v.quitChan:
-			break out
+// getScriptValidatorPool returns the package-level pool, starting its
+// workers on first call.
+func getScriptValidatorPool() *scriptValidatorPool {
+	scriptValPoolOnce.Do(func() {
+		workers := runtime.NumCPU()
+		if workers < 1 {
+			workers = 1
 		}
+
+		// Buffer scaled to worker count: large enough that submit
+		// rarely blocks (so the per-Validate select can stay in
+		// "submit fast, collect occasionally" mode), small enough
+		// that we don't pre-allocate a giant pipeline.
+		scriptValPool = &scriptValidatorPool{
+			workCh: make(chan scriptValidateJob, workers*4),
+		}
+		for i := 0; i < workers; i++ {
+			go scriptValPool.worker()
+		}
+	})
+	return scriptValPool
+}
+
+// worker is the long-lived job loop for one pool slot.  Pulls jobs off
+// the shared work channel, runs script validation, and posts the
+// result back to the job's per-call result channel.  Honors per-call
+// cancellation as a fast-path skip so a failed Validate doesn't keep
+// the pool busy on doomed work.
+func (p *scriptValidatorPool) worker() {
+	for job := range p.workCh {
+		// Skip work if the per-call Validate has already hit an
+		// error and closed its cancel channel.  We still post a
+		// result so Validate's drain loop terminates.
+		select {
+		case <-job.cancel:
+			job.resultCh <- nil
+			continue
+		default:
+		}
+
+		job.resultCh <- runScriptVerify(job)
 	}
 }
 
-// Validate validates the scripts for all of the passed transaction inputs using
-// multiple goroutines.
+// runScriptVerify executes the script-pair validation for a single
+// input.  Pulled out of the per-block validator goroutine into a free
+// function so workers can call it without any per-block receiver.
+func runScriptVerify(job scriptValidateJob) error {
+	item := job.item
+	txIn := item.txIn
+
+	// Ensure the referenced input utxo is available.
+	utxo := job.utxoView.LookupEntry(txIn.PreviousOutPoint)
+	if utxo == nil {
+		str := fmt.Sprintf("unable to find unspent output %v "+
+			"referenced from transaction %s:%d",
+			txIn.PreviousOutPoint, item.tx.Hash(),
+			item.txInIndex)
+		return ruleError(ErrMissingTxOut, str)
+	}
+
+	sigScript := txIn.SignatureScript
+	witness := txIn.Witness
+	pkScript := utxo.PkScript()
+	inputAmount := utxo.Amount()
+	vm, err := txscript.NewEngine(
+		pkScript, item.tx.MsgTx(), item.txInIndex,
+		job.flags, job.sigCache, item.sigHashes,
+		inputAmount, job.utxoView,
+	)
+	if err != nil {
+		str := fmt.Sprintf("failed to parse input %s:%d which "+
+			"references output %v - %v (input witness %x, input "+
+			"script bytes %x, prev output script bytes %x)",
+			item.tx.Hash(), item.txInIndex,
+			txIn.PreviousOutPoint, err, witness,
+			sigScript, pkScript)
+		return ruleError(ErrScriptMalformed, str)
+	}
+
+	if err := vm.Execute(); err != nil {
+		str := fmt.Sprintf("failed to validate input %s:%d which "+
+			"references output %v - %v (input witness %x, input "+
+			"script bytes %x, prev output script bytes %x)",
+			item.tx.Hash(), item.txInIndex,
+			txIn.PreviousOutPoint, err, witness,
+			sigScript, pkScript)
+		return ruleError(ErrScriptValidation, str)
+	}
+
+	return nil
+}
+
+// txValidator carries the per-Validate-call state -- the UTXO view,
+// script flags, and caches that each input's verification needs.  It
+// no longer owns any goroutines; Validate dispatches into the shared
+// scriptValidatorPool.
+type txValidator struct {
+	utxoView  *UtxoViewpoint
+	flags     txscript.ScriptFlags
+	sigCache  *txscript.SigCache
+	hashCache *txscript.HashCache
+}
+
+// Validate validates the scripts for all of the passed transaction
+// inputs through the shared scriptValidatorPool.
 func (v *txValidator) Validate(items []*txValidateItem) error {
 	if len(items) == 0 {
 		return nil
 	}
 
-	// Limit the number of goroutines to do script validation based on the
-	// number of processor cores.  This helps ensure the system stays
-	// reasonably responsive under heavy load.
-	maxGoRoutines := runtime.NumCPU() * 3
-	if maxGoRoutines <= 0 {
-		maxGoRoutines = 1
-	}
-	if maxGoRoutines > len(items) {
-		maxGoRoutines = len(items)
-	}
+	pool := getScriptValidatorPool()
 
-	// Start up validation handlers that are used to asynchronously
-	// validate each transaction input.
-	for i := 0; i < maxGoRoutines; i++ {
-		go v.validateHandler()
+	// resultCh is buffered so workers never block on send: that lets
+	// us drain all submitted jobs before returning even on early
+	// error, without orphaning workers on a dangling unbuffered
+	// channel.  Capped at a moderate size so very large batches don't
+	// pre-allocate a huge channel pipeline; the per-iteration drain
+	// in the select loop keeps the buffer from filling.
+	resultBuf := len(items)
+	if resultBuf > 64 {
+		resultBuf = 64
 	}
+	resultCh := make(chan error, resultBuf)
+	cancel := make(chan struct{})
 
-	// Validate each of the inputs.  The quit channel is closed when any
-	// errors occur so all processing goroutines exit regardless of which
-	// input had the validation error.
-	numInputs := len(items)
+	var firstErr error
+	cancelled := false
 	currentItem := 0
 	processedItems := 0
-	for processedItems < numInputs {
-		// Only send items while there are still items that need to
-		// be processed.  The select statement will never select a nil
-		// channel.
-		var validateChan chan *txValidateItem
-		var item *txValidateItem
-		if currentItem < numInputs {
-			validateChan = v.validateChan
-			item = items[currentItem]
+	for processedItems < len(items) {
+		// Drive submit + collect in a single select so a slow
+		// collect doesn't stall submit and a slow worker doesn't
+		// stall collect.  Setting workCh to nil after the last
+		// submit disables the submit branch for the remaining
+		// iterations.
+		var workCh chan<- scriptValidateJob
+		var job scriptValidateJob
+		if currentItem < len(items) {
+			workCh = pool.workCh
+			job = scriptValidateJob{
+				item:     items[currentItem],
+				utxoView: v.utxoView,
+				flags:    v.flags,
+				sigCache: v.sigCache,
+				resultCh: resultCh,
+				cancel:   cancel,
+			}
 		}
 
 		select {
-		case validateChan <- item:
+		case workCh <- job:
 			currentItem++
 
-		case err := <-v.resultChan:
+		case err := <-resultCh:
 			processedItems++
-			if err != nil {
-				close(v.quitChan)
-				return err
+			if err != nil && firstErr == nil {
+				firstErr = err
+				if !cancelled {
+					close(cancel)
+					cancelled = true
+				}
 			}
 		}
 	}
-
-	close(v.quitChan)
-	return nil
+	return firstErr
 }
 
 // newTxValidator returns a new instance of txValidator to be used for
@@ -178,13 +229,10 @@ func (v *txValidator) Validate(items []*txValidateItem) error {
 func newTxValidator(utxoView *UtxoViewpoint, flags txscript.ScriptFlags,
 	sigCache *txscript.SigCache, hashCache *txscript.HashCache) *txValidator {
 	return &txValidator{
-		validateChan: make(chan *txValidateItem),
-		quitChan:     make(chan struct{}),
-		resultChan:   make(chan error),
-		utxoView:     utxoView,
-		sigCache:     sigCache,
-		hashCache:    hashCache,
-		flags:        flags,
+		utxoView:  utxoView,
+		sigCache:  sigCache,
+		hashCache: hashCache,
+		flags:     flags,
 	}
 }
 
