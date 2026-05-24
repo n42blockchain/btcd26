@@ -121,16 +121,24 @@ func (c *chainView) setTip(node *blockNode) {
 	}
 
 	// Create or resize the slice that will hold the block nodes to the
-	// provided tip height.  When creating the slice, it is created with
-	// some additional capacity for the underlying array as append would do
-	// in order to reduce overhead when extending the chain later.  As long
-	// as the underlying array already has enough capacity, simply expand or
-	// contract the slice accordingly.  The additional capacity is chosen
-	// such that the array should only have to be extended about once a
-	// week.
+	// provided tip height.  As long as the underlying array already has
+	// enough capacity, simply expand or contract the slice accordingly.
+	// When growing the backing array, double the capacity so the
+	// cumulative copy cost over a full IBD is amortized O(N) instead
+	// of the O(N²) the previous "add one week of headroom per grow"
+	// strategy produced: 950k headers × ~1k grows each copying an
+	// average of 475k pointers = ~3.5 GiB of pure realloc churn,
+	// dominating the alloc profile.  Floor the new capacity at
+	// needed+approxNodesPerWeek so the very first grow from genesis
+	// reserves at least a week of slack and tiny chains don't end
+	// up reallocating every header.
 	needed := node.height + 1
 	if int32(cap(c.nodes)) < needed {
-		nodes := make([]*blockNode, needed, needed+approxNodesPerWeek)
+		grown := int32(cap(c.nodes)) * 2
+		if grown < needed+approxNodesPerWeek {
+			grown = needed + approxNodesPerWeek
+		}
+		nodes := make([]*blockNode, needed, grown)
 		copy(nodes, c.nodes)
 		c.nodes = nodes
 	} else {
