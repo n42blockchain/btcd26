@@ -594,8 +594,19 @@ func (b *BlockChain) connectBlock(node *blockNode, block *btcutil.Block,
 			"that extends the main chain")
 	}
 
-	// Sanity check the correct number of stxos are provided.
-	if len(stxos) != countSpentOutputs(block) {
+	// Sanity check the correct number of stxos are provided -- but
+	// only when the caller was supposed to build them in the first
+	// place.  For pre-checkpoint heights without indexers, the spend
+	// journal and indexer paths are both no-ops (see skipUndo
+	// rationale below and the matching skip in connectBestChain), so
+	// the caller intentionally passes an empty slice and the count
+	// will not match.
+	skipUndo := false
+	if cp := b.LatestCheckpoint(); cp != nil && node.height <= cp.Height {
+		skipUndo = true
+	}
+	needStxos := !skipUndo || b.indexManager != nil
+	if needStxos && len(stxos) != countSpentOutputs(block) {
 		return AssertError("connectBlock called with inconsistent " +
 			"spent transaction out information")
 	}
