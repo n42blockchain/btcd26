@@ -817,6 +817,21 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockMsg) {
 	blockHash := bmsg.block.Hash()
 	if _, exists = state.requestedBlocks[*blockHash]; !exists {
 		if _, global := sm.requestedBlocks[*blockHash]; !global {
+			// Late-arriving speculative duplicate: when both
+			// peers we asked deliver the same block, the first
+			// delivery clears the request from BOTH the per-peer
+			// and global maps (see dual-map cleanup below) so the
+			// second delivery falls through to here.  Treat as a
+			// harmless duplicate, NOT a protocol violation —
+			// disconnecting honest peers that happened to lose
+			// the speculative race burns the very capacity that
+			// speculative re-request was supposed to harness, and
+			// observed under load it churns through the peer
+			// pool fast enough to stall the IBD pipeline.
+			if have, _ := sm.chain.HaveBlock(blockHash); have {
+				return
+			}
+
 			// Regtest sends some blocks twice intentionally; let
 			// those through to exercise duplicate-rejection in
 			// the chain.
