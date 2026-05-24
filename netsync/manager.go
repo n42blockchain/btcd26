@@ -87,21 +87,27 @@ const (
 	// cheaper to lose the link to a slow peer than to keep waiting on
 	// them.  Tuned looser than headOfLineTimeout because this catches
 	// peers that have any in-flight chunk going stale, not just the
-	// head-of-line one.  Post-segwit blocks can legitimately take 10-20s
-	// to deliver over a marginal-bandwidth peer; 30 s avoids killing
-	// those connections while still cleaning up genuinely dead ones.
-	peerAssignmentTimeout = 30 * time.Second
+	// head-of-line one.  15 s catches genuinely dead peers within one
+	// reclaim cycle while still letting marginal-bandwidth peers finish
+	// a single segwit-era block (typical worst-case ≈10 s).
+	// Established peers get establishedPeerThreshold × this leash
+	// (≈150 s, see reclaimStalledAssignments) so we don't churn
+	// the rare fast-and-proven outbound link.
+	peerAssignmentTimeout = 15 * time.Second
 
 	// headOfLineTimeout is how long the peer holding the next-needed
 	// block (orderedNext) gets to deliver it before checkHeadOfLineStall
 	// fires a *duplicate* getdata to another peer (no disconnect — see
 	// trySpeculativeFetch).  Each duplicate is a full block of wasted
 	// bandwidth, so a tight bound here trades download bandwidth for
-	// chain-advance latency.  5 s strikes a balance: triggers only on
-	// genuinely slow head-of-line peers (typical good-peer block
-	// delivery is well under 2 s) while keeping duplicate volume
-	// manageable.
-	headOfLineTimeout = 5 * time.Second
+	// chain-advance latency.  3 s catches stalled peers fast enough
+	// that the orderedNext cursor doesn't sit idle when one peer in a
+	// chunk goes slow (observed real-world: a 5 s setting compounded
+	// to 15-30 s of chain stall while waiting through 5-10 sequential
+	// re-requests within one stuck peer's assigned chunk); typical
+	// good-peer block delivery is under 1 s so the duplicate rate
+	// stays low.
+	headOfLineTimeout = 3 * time.Second
 
 	// ibdScheduleInterval is how often blockHandler ticks the IBD
 	// scheduler / stall detection.  Short so head-of-line peer detection
