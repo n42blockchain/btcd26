@@ -1339,52 +1339,53 @@ func (b *BlockChain) connectBestChain(node *blockNode, block *btcutil.Block, fla
 	// the blocks that form the new chain to the main chain starting at the
 	// common ancenstor (the point where the chain forked).
 
-	// Refuse reorgs whose fork point sits below any hard-coded
-	// checkpoint.  Pre-checkpoint blocks are final by definition (the
-	// checkpoint hash anchors a single canonical history); accepting a
-	// reorg there means trusting a peer to overwrite a span the protocol
-	// has already declared immutable.  In practice this blocks the
-	// "early-mainnet BIP-30 duplicate fork" DoS — a malicious peer
-	// advertises an alternate chain that forks at height ~170 with a
-	// coinbase whose txid collides with the canonical block's coinbase,
-	// causing the reorg to fail BIP-30 mid-flight and the node to
-	// repeatedly attempt the same doomed reorg every time a peer
-	// re-announces the fork tip.  Bitcoin Core refuses such reorgs by
-	// rejecting headers that don't chain through a checkpoint; we apply
-	// the equivalent guard at the reorg gate.
-	if cp := b.LatestCheckpoint(); cp != nil {
-		forkNode := b.bestChain.FindFork(node)
-		if forkNode != nil && forkNode.height < cp.Height {
-			str := fmt.Sprintf("refusing reorg to %v: fork "+
-				"point at height %d is below latest "+
-				"hard-coded checkpoint at height %d",
-				node.hash, forkNode.height, cp.Height)
-			log.Warn(str)
-			b.index.SetStatusFlags(node, statusValidateFailed)
-			return false, ruleError(ErrForkTooOld, str)
+	detachNodes, attachNodes := b.getReorganizeNodes(node)
+
+	// Refuse reorgs that would DETACH main-chain blocks committed at or
+	// below a hard-coded checkpoint.  Once the active chain has crossed
+	// a checkpoint (or has committed history that the protocol declares
+	// immutable up to one), allowing a peer to roll that history back
+	// requires trusting them to overwrite a span the network has
+	// already finalized.  In practice this blocks the early-mainnet
+	// BIP-30 duplicate-fork DoS: a peer advertises an alternate chain
+	// that forks at height ~170 with a coinbase whose txid collides
+	// with the canonical block's coinbase, causing the reorg to fail
+	// BIP-30 mid-flight every time the fork tip is re-announced.
+	//
+	// IMPORTANT: only refuse when detachNodes is non-empty.  A
+	// "reorg" with zero detach is really an extension through
+	// previously side-chained blocks (e.g. canonical-N+1 arriving
+	// while main chain is at N and canonical-N exists as a side
+	// chain), which is always safe — no committed history is being
+	// undone — and refusing it would freeze the chain at N forever.
+	if detachNodes.Len() > 0 {
+		var thresholdHeight int32
+		var thresholdLabel string
+		if cp := b.LatestCheckpoint(); cp != nil {
+			thresholdHeight = cp.Height
+			thresholdLabel = "latest"
+		} else if len(b.checkpoints) > 0 {
+			thresholdHeight = b.checkpoints[0].Height
+			thresholdLabel = "first"
 		}
-	} else if len(b.checkpoints) > 0 {
-		// Tip is still below the first hard-coded checkpoint.  We
-		// know which heights the canonical chain occupies up to
-		// that checkpoint; any side chain rooted in that range
-		// cannot win without contradicting the checkpoint.  Refuse
-		// the reorg and mark the requesting node invalid so the
-		// peer that fed us this fork gets disconnected on its
-		// next attempt.
-		firstCp := b.checkpoints[0]
-		forkNode := b.bestChain.FindFork(node)
-		if forkNode != nil && forkNode.height < firstCp.Height {
-			str := fmt.Sprintf("refusing reorg to %v: fork "+
-				"point at height %d is below first "+
-				"hard-coded checkpoint at height %d",
-				node.hash, forkNode.height, firstCp.Height)
-			log.Warn(str)
-			b.index.SetStatusFlags(node, statusValidateFailed)
-			return false, ruleError(ErrForkTooOld, str)
+		if thresholdLabel != "" {
+			forkNode := b.bestChain.FindFork(node)
+			if forkNode != nil && forkNode.height < thresholdHeight {
+				str := fmt.Sprintf("refusing reorg to %v: "+
+					"would detach %d main-chain "+
+					"blocks below %s hard-coded "+
+					"checkpoint at height %d (fork "+
+					"point at height %d)",
+					node.hash, detachNodes.Len(),
+					thresholdLabel, thresholdHeight,
+					forkNode.height)
+				log.Warn(str)
+				b.index.SetStatusFlags(node, statusValidateFailed)
+				b.invalidateBestHeaderFork(forkNode)
+				return false, ruleError(ErrForkTooOld, str)
+			}
 		}
 	}
-
-	detachNodes, attachNodes := b.getReorganizeNodes(node)
 
 	// Reorganize the chain.
 	log.Infof("REORGANIZE: Block %v is causing a reorganize.", node.hash)
@@ -1399,6 +1400,53 @@ func (b *BlockChain) connectBestChain(node *blockNode, block *btcutil.Block, fla
 	}
 
 	return err == nil, err
+}
+
+// invalidateBestHeaderFork walks bestHeader from forkNode.height+1 to
+// tip, marks every node along that span as statusInvalidAncestor, and
+// resets bestHeader.Tip to forkNode.  Used when the active chain has
+// just refused to reorganize to a fork at or above forkNode: without
+// resetting bestHeader, parallel-fetch keeps requesting blocks along
+// the (now rejected) fork chain, and future header processing keeps
+// comparing against the fork tip's massive cumulative work, so the
+// node stays frozen at forkNode forever.  After this call, future
+// header batches from a peer on the canonical chain extend the
+// header view normally (their cumulative work now exceeds forkNode's,
+// which is what bestHeader is pointing at).
+//
+// MUST be called with chainLock held (for writes).
+func (b *BlockChain) invalidateBestHeaderFork(forkNode *blockNode) {
+	if forkNode == nil {
+		return
+	}
+
+	tipHeight := b.bestHeader.Height()
+	if tipHeight <= forkNode.height {
+		return
+	}
+
+	// Every node currently in bestHeader chain above forkNode is a
+	// descendant of the rejected fork by construction (bestHeader is a
+	// linear chainview), so they are all transitively invalid even
+	// without per-node validation.  Mark them explicitly so future
+	// header batches that re-offer the same hashes are rejected at the
+	// KnownInvalid check.
+	marked := 0
+	for h := forkNode.height + 1; h <= tipHeight; h++ {
+		n := b.bestHeader.NodeByHeight(h)
+		if n == nil {
+			continue
+		}
+		b.index.SetStatusFlags(n, statusInvalidAncestor)
+		marked++
+	}
+
+	log.Warnf("reset bestHeader from height %d to fork point at "+
+		"height %d (%v); marked %d descendant headers as "+
+		"invalid-ancestor", tipHeight, forkNode.height,
+		forkNode.hash, marked)
+
+	b.bestHeader.SetTip(forkNode)
 }
 
 // isCurrent returns whether or not the chain believes it is current.  Several
