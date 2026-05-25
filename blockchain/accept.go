@@ -75,7 +75,9 @@ func (b *BlockChain) maybeAcceptBlock(block *btcutil.Block, flags BehaviorFlags)
 	// allows block download to be decoupled from the much more expensive
 	// connection logic.  Folding the block store and the index flush into one
 	// commit saves an mdbx commit (cgo + fsync) per accepted block.
-	err = b.db.Update(func(dbTx database.Tx) error {
+	// guardedUpdate so this block-store commit shares the single MDBX
+	// writer fairly with an in-progress background async flush.
+	err = b.utxoCache.guardedUpdate(func(dbTx database.Tx) error {
 		if err := dbStoreBlock(dbTx, block); err != nil {
 			return err
 		}

@@ -254,6 +254,32 @@ type utxoCache struct {
 	// flushDone receives the result of the background flush exactly once;
 	// nil when no async flush is in progress.
 	flushDone chan error
+
+	// flushGate fairly serializes the single MDBX writer between the
+	// background chunked flush and block-connect commits.  MDBX's own
+	// write lock is an OS mutex whose handoff favors the tight-looping
+	// background flush goroutine, starving the block-connect commits for
+	// many chunks (measured: block processing crawled at ~0.9 blk/s
+	// during a flush because each commit waited through ~10 chunks).
+	// A Go sync.Mutex enters starvation-mode handoff after 1 ms, so a
+	// commit that waits gets the writer right after the current chunk
+	// instead of losing the race repeatedly — moving the contention off
+	// the unfair OS mutex and onto this fair one.  Only engaged when the
+	// async flush is enabled.
+	flushGate sync.Mutex
+}
+
+// guardedUpdate runs fn inside a writable database transaction, serialized
+// through flushGate so the background chunked flush and block-connect
+// commits get fair turns at the single MDBX writer.  When the async flush
+// is disabled there is no background writer to contend with, so the gate
+// is skipped entirely.
+func (s *utxoCache) guardedUpdate(fn func(database.Tx) error) error {
+	if s.asyncFlush {
+		s.flushGate.Lock()
+		defer s.flushGate.Unlock()
+	}
+	return s.db.Update(fn)
 }
 
 // newUtxoCache initiates a new utxo cache instance with its memory usage limited
@@ -711,11 +737,6 @@ func asyncFlushChunkDefault() int {
 	return def
 }
 
-// asyncFlushChunkYield is a brief pause between chunk transactions so a
-// block-connect commit waiting on the MDBX writer reliably gets a turn
-// before the background flush re-acquires it for the next chunk.
-const asyncFlushChunkYield = 2 * time.Millisecond
-
 // flushFrozenItem pairs an outpoint with its frozen-snapshot entry for
 // chunked writing.
 type flushFrozenItem struct {
@@ -747,7 +768,9 @@ func (s *utxoCache) flushFrozen(ms *mapSlice, hash chainhash.Hash) error {
 		if len(chunk) == 0 {
 			return nil
 		}
-		err := s.db.Update(func(dbTx database.Tx) error {
+		// guardedUpdate releases the fairness gate between chunks so a
+		// waiting block-connect commit gets the writer next.
+		err := s.guardedUpdate(func(dbTx database.Tx) error {
 			return writeFrozenChunk(dbTx, chunk)
 		})
 		chunk = chunk[:0]
@@ -761,9 +784,6 @@ func (s *utxoCache) flushFrozen(ms *mapSlice, hash chainhash.Hash) error {
 				if err := flushChunk(); err != nil {
 					return err
 				}
-				// Let a waiting block-connect commit take the
-				// writer before the next chunk grabs it.
-				time.Sleep(asyncFlushChunkYield)
 			}
 		}
 	}
@@ -772,7 +792,7 @@ func (s *utxoCache) flushFrozen(ms *mapSlice, hash chainhash.Hash) error {
 	}
 
 	// Marker last — only now is the whole snapshot durable.
-	return s.db.Update(func(dbTx database.Tx) error {
+	return s.guardedUpdate(func(dbTx database.Tx) error {
 		return dbPutUtxoStateConsistency(dbTx, &hash)
 	})
 }
