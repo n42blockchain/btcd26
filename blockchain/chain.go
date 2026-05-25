@@ -632,11 +632,8 @@ func (b *BlockChain) connectBlock(node *blockNode, block *btcutil.Block,
 		curTotalTxns+numTxns, CalcPastMedianTime(node),
 	)
 
-	// Atomically insert info into the database.  Routed through
-	// guardedUpdate so this commit gets fair access to the single MDBX
-	// writer when a background async flush is in progress (otherwise the
-	// flush's tight chunk loop starves block-connect commits).
-	err := b.utxoCache.guardedUpdate(func(dbTx database.Tx) error {
+	// Atomically insert info into the database.
+	err := b.db.Update(func(dbTx database.Tx) error {
 		// Write any dirty block-index node status changes as part of this
 		// same transaction rather than in a separate commit beforehand.
 		// Folding the index flush into the best-state write halves the
