@@ -554,3 +554,42 @@ func (bi *blockIndex) flushToDB() error {
 	bi.Unlock()
 	return err
 }
+
+// flushToDBTx writes all dirty block nodes that have block data into the
+// provided transaction WITHOUT opening or committing its own.  On success
+// it clears the dirty set.  This lets a caller fold the block-index flush
+// into a larger transaction (e.g. connectBlock's best-state write) so a
+// block connection costs a single mdbx commit instead of two back-to-back
+// ones — during full-block IBD the serial commit path is ~half the
+// wall-clock per block, so halving its commit count is a direct speedup.
+//
+// Header-only nodes are intentionally skipped (same backwards-compat
+// reasoning as flushToDB).  The dirty set is cleared only after every
+// needed node is written without error; on error it is left intact.
+//
+// Folding the flush into a wider transaction means a later failure in
+// that transaction rolls back these node writes too while the in-memory
+// dirty set has already been cleared.  That is acceptable here: the only
+// realistic failure under FAST_SYNC is disk-full/corruption, after which
+// the node restarts and reconcile rebuilds from the durable best-state —
+// the same recovery path the previous two-commit sequence relied on.
+func (bi *blockIndex) flushToDBTx(dbTx database.Tx) error {
+	bi.Lock()
+	defer bi.Unlock()
+
+	if len(bi.dirty) == 0 {
+		return nil
+	}
+
+	for node := range bi.dirty {
+		if node.status.HaveHeader() && !node.status.HaveData() {
+			continue
+		}
+		if err := dbStoreBlockNode(dbTx, node); err != nil {
+			return err
+		}
+	}
+
+	bi.dirty = make(map[*blockNode]struct{})
+	return nil
+}

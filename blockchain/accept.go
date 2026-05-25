@@ -45,22 +45,6 @@ func (b *BlockChain) maybeAcceptBlock(block *btcutil.Block, flags BehaviorFlags)
 		return false, err
 	}
 
-	// Insert the block into the database if it's not already there.  Even
-	// though it is possible the block will ultimately fail to connect, it
-	// has already passed all proof-of-work and validity tests which means
-	// it would be prohibitively expensive for an attacker to fill up the
-	// disk with a bunch of blocks that fail to connect.  This is necessary
-	// since it allows block download to be decoupled from the much more
-	// expensive connection logic.  It also has some other nice properties
-	// such as making blocks that never become part of the main chain or
-	// blocks that fail to connect available for further analysis.
-	err = b.db.Update(func(dbTx database.Tx) error {
-		return dbStoreBlock(dbTx, block)
-	})
-	if err != nil {
-		return false, err
-	}
-
 	// Create a new block node for the block and add it to the node index. Even
 	// if the block ultimately gets connected to the main chain, it starts out
 	// on a side chain.
@@ -69,6 +53,9 @@ func (b *BlockChain) maybeAcceptBlock(block *btcutil.Block, flags BehaviorFlags)
 	// upgrade its status rather than creating a new node.  Creating a new
 	// node would overwrite the index entry, orphaning the pointer held by
 	// bestHeader's chainView and breaking Contains checks.
+	//
+	// The in-memory node update happens before the store transaction so the
+	// block bytes and the node status flush can share a single commit below.
 	newNode := b.index.LookupNode(block.Hash())
 	if newNode != nil {
 		b.index.SetStatusFlags(newNode, statusDataStored)
@@ -78,7 +65,22 @@ func (b *BlockChain) maybeAcceptBlock(block *btcutil.Block, flags BehaviorFlags)
 		newNode.status = statusDataStored | statusHeaderStored
 		b.index.AddNode(newNode)
 	}
-	err = b.index.flushToDB()
+
+	// Insert the block into the database if it's not already there, and flush
+	// the new node's index status in the SAME transaction.  Even though it is
+	// possible the block will ultimately fail to connect, it has already
+	// passed all proof-of-work and validity tests which means it would be
+	// prohibitively expensive for an attacker to fill up the disk with a
+	// bunch of blocks that fail to connect.  This is necessary since it
+	// allows block download to be decoupled from the much more expensive
+	// connection logic.  Folding the block store and the index flush into one
+	// commit saves an mdbx commit (cgo + fsync) per accepted block.
+	err = b.db.Update(func(dbTx database.Tx) error {
+		if err := dbStoreBlock(dbTx, block); err != nil {
+			return err
+		}
+		return b.index.flushToDBTx(dbTx)
+	})
 	if err != nil {
 		return false, err
 	}

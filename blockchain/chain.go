@@ -620,12 +620,6 @@ func (b *BlockChain) connectBlock(node *blockNode, block *btcutil.Block,
 		}
 	}
 
-	// Write any block status changes to DB before updating best state.
-	err := b.index.flushToDB()
-	if err != nil {
-		return err
-	}
-
 	// Generate a new best state snapshot that will be used to update the
 	// database and later memory if all database updates are successful.
 	b.stateLock.RLock()
@@ -639,7 +633,17 @@ func (b *BlockChain) connectBlock(node *blockNode, block *btcutil.Block,
 	)
 
 	// Atomically insert info into the database.
-	err = b.db.Update(func(dbTx database.Tx) error {
+	err := b.db.Update(func(dbTx database.Tx) error {
+		// Write any dirty block-index node status changes as part of this
+		// same transaction rather than in a separate commit beforehand.
+		// Folding the index flush into the best-state write halves the
+		// mdbx commit count (and the accompanying cgo + fsync) on the
+		// serial block-connect path, which dominates full-block IBD wall
+		// time once script verification parallelizes across cores.
+		if err := b.index.flushToDBTx(dbTx); err != nil {
+			return err
+		}
+
 		// If the pruneTarget isn't 0, we should attempt to delete older blocks
 		// from the database.
 		if b.pruneTarget != 0 {
