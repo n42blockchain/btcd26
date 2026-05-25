@@ -7,8 +7,21 @@ package chainhash
 
 import (
 	"crypto/sha256"
+	"hash"
 	"io"
+	"sync"
 )
+
+// sha256Pool recycles sha256 hashers for DoubleHashRaw.  A fresh
+// sha256.New() heap-allocates its digest state on every call; during
+// full-block IBD that single call site (one per tx sighash / merkle
+// step) was ~7% of total allocation churn in the pprof series.  The
+// hasher carries no state across a Reset, so pooling it is safe and
+// concurrency-clean (DoubleHashRaw runs on many script-verify
+// goroutines at once).
+var sha256Pool = sync.Pool{
+	New: func() interface{} { return sha256.New() },
+}
 
 // HashB calculates hash(b) and returns the resulting bytes.
 func HashB(b []byte) []byte {
@@ -41,17 +54,22 @@ func DoubleHashRaw(serialize func(w io.Writer) error) Hash {
 	// Encode the transaction into the hash.  Ignore the error returns
 	// since the only way the encode could fail is being out of memory
 	// or due to nil pointers, both of which would cause a run-time panic.
-	h := sha256.New()
+	//
+	// The hasher is borrowed from a pool and reset before use, then
+	// returned for reuse.  The Hash result is copied out by value below,
+	// so nothing in the pooled hasher is retained after return.
+	h := sha256Pool.Get().(hash.Hash)
+	h.Reset()
 	_ = serialize(h)
 
 	// This buf is here because Sum() will append the result to the passed
 	// in byte slice.  Pre-allocating here saves an allocation on the second
-	// hash as we can reuse it.  This allocation also does not escape to the
-	// heap, saving an allocation.
+	// hash as we can reuse it.
 	buf := make([]byte, 0, HashSize)
 	first := h.Sum(buf)
 	h.Reset()
 	h.Write(first)
 	res := h.Sum(buf)
+	sha256Pool.Put(h)
 	return *(*Hash)(res)
 }

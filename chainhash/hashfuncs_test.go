@@ -151,3 +151,23 @@ func TestDoubleHashFuncs(t *testing.T) {
 		}
 	}
 }
+
+// BenchmarkDoubleHashRaw measures the pooled-hasher double-hash path used
+// for transaction sighash and merkle computation during block validation.
+func BenchmarkDoubleHashRaw(b *testing.B) {
+	// A ~250-byte payload approximates a small transaction's serialized
+	// form fed to the hasher.
+	payload := make([]byte, 250)
+	for i := range payload {
+		payload[i] = byte(i)
+	}
+	serialize := func(w io.Writer) error {
+		_, err := w.Write(payload)
+		return err
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = DoubleHashRaw(serialize)
+	}
+}
