@@ -8,6 +8,7 @@ import (
 	"container/list"
 	"fmt"
 	"os"
+	"strconv"
 	"sync"
 	"time"
 
@@ -682,11 +683,33 @@ func writeMapSliceEntries(dbTx database.Tx, ms *mapSlice) error {
 // commit behind it (observed: ~23 min dead stop at a 522 GiB database).
 // Chunking releases the writer between transactions so block validation +
 // commit interleave — the 32-core script verification that dominates
-// post-checkpoint IBD overlaps the flush instead of idling.  Smaller
-// chunks interleave more finely at the cost of more per-transaction
-// overhead; 64 Ki balances the two.  It is a var only so tests can lower
-// it to exercise the multi-chunk path; production never changes it.
-var asyncFlushChunkEntries = 65536
+// post-checkpoint IBD overlaps the flush instead of idling.
+//
+// The chunk size must keep each chunk's write time well under a block's
+// validate time (~tens of ms) so the block-connect commit-wait between
+// chunks stays small and validation actually overlaps the flush.  A live
+// soak at a 644 GiB database measured a 64 Ki chunk at ~1.4 s of B+tree
+// write — far too coarse: during-flush block throughput was only ~0.15
+// blk/s (commit-wait dominated, validation did not overlap).  4 Ki brings
+// the chunk write to ~85 ms there, comparable to the per-block validate
+// time, so validation overlaps and during-flush throughput rises toward
+// the validation-bound rate.  Smaller still trades interleaving for
+// per-transaction overhead.  The value is hardware/db-size dependent, so
+// it is overridable via BTCD_ASYNC_FLUSH_CHUNK; it is also a var so tests
+// can lower it to exercise the multi-chunk path.
+var asyncFlushChunkEntries = asyncFlushChunkDefault()
+
+// asyncFlushChunkDefault returns the per-chunk entry count, honoring the
+// BTCD_ASYNC_FLUSH_CHUNK override when set to a positive integer.
+func asyncFlushChunkDefault() int {
+	const def = 4096
+	if v := os.Getenv("BTCD_ASYNC_FLUSH_CHUNK"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return def
+}
 
 // asyncFlushChunkYield is a brief pause between chunk transactions so a
 // block-connect commit waiting on the MDBX writer reliably gets a turn
