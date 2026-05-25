@@ -246,10 +246,6 @@ type utxoCache struct {
 	// background goroutine, or nil when no async flush is in progress.
 	flushing *mapSlice
 
-	// flushingEntryMemory is the entry-memory of the frozen snapshot,
-	// retained so reorg/shutdown accounting stays correct.
-	flushingEntryMemory uint64
-
 	// flushingHash is the consistency hash the in-progress background
 	// flush will commit once the frozen snapshot is fully written.
 	flushingHash chainhash.Hash
@@ -781,7 +777,6 @@ func (s *utxoCache) reapAsyncFlush(wait bool) error {
 
 	s.flushDone = nil
 	s.flushing = nil
-	s.flushingEntryMemory = 0
 	if err != nil {
 		return err
 	}
@@ -884,7 +879,6 @@ func (s *utxoCache) maybeAsyncFlush(bestState *BestState, mode FlushMode) error 
 		maxTotalMemoryUsage: s.cachedEntries.maxTotalMemoryUsage,
 	}
 	s.flushing = frozen
-	s.flushingEntryMemory = s.totalEntryMemory
 	s.flushingHash = bestState.Hash
 
 	s.cachedEntries = newEmptyMapSlice(s.maxTotalMemoryUsage)
