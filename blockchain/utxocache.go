@@ -602,13 +602,21 @@ func (s *utxoCache) connectTransactions(block *btcutil.Block, stxos *[]SpentTxOu
 	return nil
 }
 
-// writeMapSliceEntries writes every entry in ms to the database via dbTx,
-// emptying each map as it goes: spent/nil entries are deleted, modified
-// entries are (batch-)put, clean entries are skipped.  Used by the
-// synchronous active-layer flush (writeCache); the per-entry delete is
-// what empties the retained maps[0] that deleteMaps does not drop.  It
-// does NOT write the consistency marker — the caller does.
-func writeMapSliceEntries(dbTx database.Tx, ms *mapSlice) error {
+// writeMapSliceEntries writes every entry in ms to the database via dbTx:
+// spent/nil entries are deleted, modified entries are (batch-)put, and
+// clean entries are skipped.  It does NOT write the consistency marker or
+// touch any utxoCache bookkeeping — callers do that — so it can serve both
+// the synchronous active-layer flush and the asynchronous frozen-snapshot
+// flush.
+//
+// When clearAsGo is true each entry is deleted from its map as it is
+// processed, which the synchronous path relies on to empty the retained
+// maps[0] (deleteMaps only drops maps[1:]).  The asynchronous path passes
+// false: its frozen snapshot is discarded wholesale after the flush, and
+// crucially the chain writer may be concurrently READING the same maps via
+// cacheGet — leaving the maps unmodified keeps those accesses to
+// concurrent reads, which are safe, instead of a read/write data race.
+func writeMapSliceEntries(dbTx database.Tx, ms *mapSlice, clearAsGo bool) error {
 	utxoBucket := dbTx.Metadata().Bucket(utxoSetBucketName)
 
 	// If the bucket implementation supports batched puts (mdbxdb does)
@@ -662,132 +670,8 @@ func writeMapSliceEntries(dbTx database.Tx, ms *mapSlice) error {
 				}
 			}
 
-			delete(ms.maps[i], outpoint)
-		}
-	}
-	if batcher != nil && len(batch) > 0 {
-		if err := batcher.PutBatch(batch); err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
-// asyncFlushChunkEntries is the number of frozen-snapshot entries the
-// background flush writes per database transaction.  A full flush of a
-// multi-GiB cache (tens of millions of entries) into MDBX's B+tree is
-// minutes of single-writer work; doing it in one transaction holds the
-// sole MDBX writer for that whole duration and stalls every block-connect
-// commit behind it (observed: ~23 min dead stop at a 522 GiB database).
-// Chunking releases the writer between transactions so block validation +
-// commit interleave — the 32-core script verification that dominates
-// post-checkpoint IBD overlaps the flush instead of idling.  Smaller
-// chunks interleave more finely at the cost of more per-transaction
-// overhead; 64 Ki balances the two.  It is a var only so tests can lower
-// it to exercise the multi-chunk path; production never changes it.
-var asyncFlushChunkEntries = 65536
-
-// asyncFlushChunkYield is a brief pause between chunk transactions so a
-// block-connect commit waiting on the MDBX writer reliably gets a turn
-// before the background flush re-acquires it for the next chunk.
-const asyncFlushChunkYield = 2 * time.Millisecond
-
-// flushFrozenItem pairs an outpoint with its frozen-snapshot entry for
-// chunked writing.
-type flushFrozenItem struct {
-	outpoint wire.OutPoint
-	entry    *UtxoEntry
-}
-
-// flushFrozen writes the frozen snapshot ms to the database in
-// asyncFlushChunkEntries-sized transactions, releasing the MDBX writer
-// between each so concurrent block-connect commits interleave, then
-// commits the consistency marker in a final transaction.
-//
-// Crash safety: the marker advances only after every chunk is durably
-// committed.  A crash mid-flush leaves the old on-disk marker, and
-// InitConsistentState replays from there — re-applying any
-// partially-written chunks idempotently (puts overwrite, spends
-// re-delete).  Block commits that interleave write the best-state /
-// block-index / spend-journal buckets, never the utxoSet bucket the
-// flush writes, so there is no key conflict between the two, only
-// writer serialization.
-//
-// ms is read-only here (never mutated): the chain writer may be reading
-// it concurrently via cacheGet, and both sides doing only reads keeps
-// the access data-race-free.
-func (s *utxoCache) flushFrozen(ms *mapSlice, hash chainhash.Hash) error {
-	chunk := make([]flushFrozenItem, 0, asyncFlushChunkEntries)
-
-	flushChunk := func() error {
-		if len(chunk) == 0 {
-			return nil
-		}
-		err := s.db.Update(func(dbTx database.Tx) error {
-			return writeFrozenChunk(dbTx, chunk)
-		})
-		chunk = chunk[:0]
-		return err
-	}
-
-	for i := range ms.maps {
-		for outpoint, entry := range ms.maps[i] {
-			chunk = append(chunk, flushFrozenItem{outpoint, entry})
-			if len(chunk) >= asyncFlushChunkEntries {
-				if err := flushChunk(); err != nil {
-					return err
-				}
-				// Let a waiting block-connect commit take the
-				// writer before the next chunk grabs it.
-				time.Sleep(asyncFlushChunkYield)
-			}
-		}
-	}
-	if err := flushChunk(); err != nil {
-		return err
-	}
-
-	// Marker last — only now is the whole snapshot durable.
-	return s.db.Update(func(dbTx database.Tx) error {
-		return dbPutUtxoStateConsistency(dbTx, &hash)
-	})
-}
-
-// writeFrozenChunk writes one chunk of frozen entries within dbTx:
-// spent/nil are deleted, modified are batch-put, clean are skipped.
-func writeFrozenChunk(dbTx database.Tx, items []flushFrozenItem) error {
-	utxoBucket := dbTx.Metadata().Bucket(utxoSetBucketName)
-	batcher, _ := utxoBucket.(database.BatchPutter)
-
-	var batch []database.KVPair
-	if batcher != nil {
-		batch = make([]database.KVPair, 0, len(items))
-	}
-
-	for _, it := range items {
-		entry := it.entry
-		switch {
-		case entry == nil || entry.IsSpent():
-			if err := dbDeleteUtxoEntry(utxoBucket, it.outpoint); err != nil {
-				return err
-			}
-
-		case !entry.isModified():
-		default:
-			if batcher != nil {
-				serialized, err := serializeUtxoEntry(entry)
-				if err != nil {
-					return err
-				}
-				key := outpointKey(it.outpoint)
-				batch = append(batch, database.KVPair{
-					Key: *key, Value: serialized,
-				})
-			} else {
-				if err := dbPutUtxoEntry(utxoBucket, it.outpoint, entry); err != nil {
-					return err
-				}
+			if clearAsGo {
+				delete(ms.maps[i], outpoint)
 			}
 		}
 	}
@@ -802,7 +686,7 @@ func writeFrozenChunk(dbTx database.Tx, items []flushFrozenItem) error {
 
 // writeCache writes all the entries that are cached in memory to the database atomically.
 func (s *utxoCache) writeCache(dbTx database.Tx, bestState *BestState) error {
-	if err := writeMapSliceEntries(dbTx, &s.cachedEntries); err != nil {
+	if err := writeMapSliceEntries(dbTx, &s.cachedEntries, true); err != nil {
 		return err
 	}
 	s.cachedEntries.deleteMaps()
@@ -1004,12 +888,15 @@ func (s *utxoCache) maybeAsyncFlush(bestState *BestState, mode FlushMode) error 
 	done := make(chan error, 1)
 	s.flushDone = done
 	go func(ms *mapSlice, hash chainhash.Hash) {
-		// flushFrozen writes the snapshot in chunked transactions,
-		// releasing the MDBX writer between chunks so block-connect
-		// commits interleave instead of stalling for the whole flush.
-		// ms is read-only here; the chain writer may read it
-		// concurrently via cacheGet (both sides read-only = safe).
-		done <- s.flushFrozen(ms, hash)
+		// clearAsGo=false: the chain writer may concurrently read this
+		// frozen snapshot via cacheGet, so the writer must not mutate
+		// the maps.  The snapshot is dropped wholesale once reaped.
+		done <- s.db.Update(func(dbTx database.Tx) error {
+			if err := writeMapSliceEntries(dbTx, ms, false); err != nil {
+				return err
+			}
+			return dbPutUtxoStateConsistency(dbTx, &hash)
+		})
 	}(frozen, markerHash)
 
 	return nil
