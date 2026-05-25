@@ -756,6 +756,15 @@ func (b *BlockChain) connectBlock(node *blockNode, block *btcutil.Block,
 
 	// Since we may have changed the UTXO cache, we make sure it didn't exceed its
 	// maximum size.  If we're pruned and have flushed already, this will be a no-op.
+	//
+	// When the asynchronous flush is enabled, hand a full cache off to a
+	// background writer instead of stalling here for the multi-minute
+	// duration of a multi-GiB flush.  maybeAsyncFlush opens its own
+	// transaction (MDBX is single-writer), so it must be called outside a
+	// db.Update — not wrapped like the synchronous path below.
+	if b.utxoCache.asyncFlush {
+		return b.utxoCache.maybeAsyncFlush(state, FlushIfNeeded)
+	}
 	return b.db.Update(func(dbTx database.Tx) error {
 		return b.utxoCache.flush(dbTx, FlushIfNeeded, state)
 	})
@@ -929,6 +938,18 @@ func countSpentOutputs(block *btcutil.Block) int {
 //
 // This function MUST be called with the chain state lock held (for writes).
 func (b *BlockChain) reorganizeChain(detachNodes, attachNodes *list.List) error {
+	// Drain any in-progress background UTXO flush before touching the
+	// chain state.  Reorg disconnects write the UTXO set directly via
+	// synchronous FlushRequired flushes inside their own transactions
+	// (MDBX is single-writer), and they must observe a quiescent cache
+	// with no frozen snapshot still in flight.  Draining here, outside
+	// any open write transaction, keeps both invariants.
+	if b.utxoCache.asyncFlush {
+		if err := b.utxoCache.drainAsyncFlush(); err != nil {
+			return err
+		}
+	}
+
 	// Check first that the detach and the attach nodes are valid and they
 	// pass verification.
 	detachBlocks, attachBlocks, detachSpentTxOuts,
@@ -2551,6 +2572,16 @@ func New(config *Config) (*BlockChain, error) {
 		deploymentCaches:    newThresholdCaches(chaincfg.DefinedDeployments),
 		pruneTarget:         config.Prune,
 		pruneToCheckpoint:   config.PruneToCheckpoint,
+	}
+
+	// The asynchronous UTXO flush opens its own write transaction from a
+	// background goroutine.  Pruning runs an additional FlushRequired
+	// flush inside connectBlock's already-open write transaction, which
+	// would contend with the background writer (MDBX permits one writer).
+	// Disable the async path entirely when pruning so the long-proven
+	// synchronous flush is used.
+	if b.pruneTarget != 0 {
+		b.utxoCache.asyncFlush = false
 	}
 
 	// Ensure all the deployments are synchronized with our clock if

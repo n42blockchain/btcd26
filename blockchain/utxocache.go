@@ -7,6 +7,7 @@ package blockchain
 import (
 	"container/list"
 	"fmt"
+	"os"
 	"sync"
 	"time"
 
@@ -224,6 +225,38 @@ type utxoCache struct {
 	// Below fields are used to indicate when the last flush happened.
 	lastFlushHash chainhash.Hash
 	lastFlushTime time.Time
+
+	// --- asynchronous double-buffered flush (opt-in) ---
+	//
+	// When asyncFlush is true, a full cache flush does not block block
+	// processing.  Instead the active cachedEntries map is frozen and
+	// swapped out for a fresh empty one, and a background goroutine
+	// writes the frozen snapshot to the database in its own transaction.
+	// Block processing continues against the new active map; reads fall
+	// through active -> flushing -> db, and any frozen entry that gets
+	// touched is copy-on-written into the active map so the background
+	// writer always sees the pristine swap-time snapshot.
+	//
+	// All of these fields are only ever read/written from the chain
+	// writer (under chainLock); the background goroutine only reads the
+	// frozen snapshot it was handed and signals completion on flushDone.
+	asyncFlush bool
+
+	// flushing is the frozen snapshot currently being written by the
+	// background goroutine, or nil when no async flush is in progress.
+	flushing *mapSlice
+
+	// flushingEntryMemory is the entry-memory of the frozen snapshot,
+	// retained so reorg/shutdown accounting stays correct.
+	flushingEntryMemory uint64
+
+	// flushingHash is the consistency hash the in-progress background
+	// flush will commit once the frozen snapshot is fully written.
+	flushingHash chainhash.Hash
+
+	// flushDone receives the result of the background flush exactly once;
+	// nil when no async flush is in progress.
+	flushDone chan error
 }
 
 // newUtxoCache initiates a new utxo cache instance with its memory usage limited
@@ -241,6 +274,7 @@ func newUtxoCache(db database.DB, maxTotalMemoryUsage uint64) *utxoCache {
 	return &utxoCache{
 		db:                  db,
 		maxTotalMemoryUsage: maxTotalMemoryUsage,
+		asyncFlush:          asyncFlushEnabled(),
 		cachedEntries: mapSlice{
 			maps:                []map[wire.OutPoint]*UtxoEntry{m},
 			maxEntries:          []int{numMaxElements},
@@ -249,7 +283,41 @@ func newUtxoCache(db database.DB, maxTotalMemoryUsage uint64) *utxoCache {
 	}
 }
 
+// newEmptyMapSlice returns a fresh mapSlice sized for the given memory
+// budget, matching the initial allocation newUtxoCache performs.  Used to
+// swap in a clean active layer after the previous one is frozen for an
+// asynchronous flush.
+func newEmptyMapSlice(maxTotalMemoryUsage uint64) mapSlice {
+	numMaxElements := calculateMinEntries(
+		int(maxTotalMemoryUsage), bucketSize+avgEntrySize,
+	)
+	numMaxElements -= 1
+	m := make(map[wire.OutPoint]*UtxoEntry, numMaxElements)
+	return mapSlice{
+		maps:                []map[wire.OutPoint]*UtxoEntry{m},
+		maxEntries:          []int{numMaxElements},
+		maxTotalMemoryUsage: maxTotalMemoryUsage,
+	}
+}
+
+// asyncFlushEnabled reports whether the opt-in asynchronous UTXO cache
+// flush is enabled via the BTCD_ASYNC_UTXO_FLUSH environment variable.
+// It is off by default: the synchronous path is the long-proven one,
+// and the async path trades transient 2x cache memory and added
+// complexity for not stalling block processing during a multi-GiB
+// flush.  Enable only after soak-testing on a throwaway datadir.
+func asyncFlushEnabled() bool {
+	v := os.Getenv("BTCD_ASYNC_UTXO_FLUSH")
+	return v != "" && v != "0"
+}
+
 // totalMemoryUsage returns the total memory usage in bytes of the UTXO cache.
+//
+// Only the active layer is counted: the frozen layer (when an async flush
+// is in progress) is being drained to disk and must NOT keep the active
+// layer from flushing, otherwise the threshold check would never fire
+// while a flush is pending.  Whole-process memory (active + frozen) is
+// the runtime's concern, bounded by GOMEMLIMIT.
 func (s *utxoCache) totalMemoryUsage() uint64 {
 	// Total memory is the map size + the size that the utxo entries are
 	// taking up.
@@ -257,6 +325,46 @@ func (s *utxoCache) totalMemoryUsage() uint64 {
 	size += s.totalEntryMemory
 
 	return size
+}
+
+// cacheGet returns the entry for op, consulting the active layer first
+// and then, when an async flush is in progress, the frozen layer.
+//
+// On a frozen-layer hit the entry is copy-on-written into the active
+// layer and the copy is returned: callers (notably addTxIn via
+// fetchEntries) mutate entries in place (Spend), and the background
+// flush writer must continue to see the pristine swap-time snapshot.
+// The copy also has its tfFresh flag cleared — the frozen original will
+// be (or already is) written to the database by the background flush,
+// so spending the copy must leave a spent marker that flushes as a
+// database delete rather than being dropped as a never-persisted entry.
+//
+// MUST be called with the chain lock held (for writes).
+func (s *utxoCache) cacheGet(op wire.OutPoint) (*UtxoEntry, bool) {
+	if entry, ok := s.cachedEntries.get(op); ok {
+		return entry, true
+	}
+
+	if s.flushing == nil {
+		return nil, false
+	}
+
+	entry, ok := s.flushing.get(op)
+	if !ok {
+		return nil, false
+	}
+
+	// Copy-on-write into the active layer.  Clone is nil-safe, so a
+	// negative-cache (nil) entry is propagated as a nil into the active
+	// layer unchanged.
+	clone := entry.Clone()
+	if clone != nil {
+		clone.packedFlags &^= tfFresh
+	}
+	s.cachedEntries.put(op, clone, s.totalEntryMemory)
+	s.totalEntryMemory += clone.memoryUsage()
+
+	return clone, true
 }
 
 // fetchEntries returns the UTXO entries for the given outpoints.  The function always
@@ -272,7 +380,7 @@ func (s *utxoCache) fetchEntries(outpoints []wire.OutPoint) ([]*UtxoEntry, error
 		missingOpsIdx []int
 	)
 	for i := range outpoints {
-		if entry, ok := s.cachedEntries.get(outpoints[i]); ok {
+		if entry, ok := s.cacheGet(outpoints[i]); ok {
 			entries[i] = entry
 			continue
 		}
@@ -498,11 +606,21 @@ func (s *utxoCache) connectTransactions(block *btcutil.Block, stxos *[]SpentTxOu
 	return nil
 }
 
-// writeCache writes all the entries that are cached in memory to the database atomically.
-func (s *utxoCache) writeCache(dbTx database.Tx, bestState *BestState) error {
-	// Update commits and flushes the cache to the database.
-	// NOTE: The database has its own cache which gets atomically written
-	// to leveldb.
+// writeMapSliceEntries writes every entry in ms to the database via dbTx:
+// spent/nil entries are deleted, modified entries are (batch-)put, and
+// clean entries are skipped.  It does NOT write the consistency marker or
+// touch any utxoCache bookkeeping — callers do that — so it can serve both
+// the synchronous active-layer flush and the asynchronous frozen-snapshot
+// flush.
+//
+// When clearAsGo is true each entry is deleted from its map as it is
+// processed, which the synchronous path relies on to empty the retained
+// maps[0] (deleteMaps only drops maps[1:]).  The asynchronous path passes
+// false: its frozen snapshot is discarded wholesale after the flush, and
+// crucially the chain writer may be concurrently READING the same maps via
+// cacheGet — leaving the maps unmodified keeps those accesses to
+// concurrent reads, which are safe, instead of a read/write data race.
+func writeMapSliceEntries(dbTx database.Tx, ms *mapSlice, clearAsGo bool) error {
 	utxoBucket := dbTx.Metadata().Bucket(utxoSetBucketName)
 
 	// If the bucket implementation supports batched puts (mdbxdb does)
@@ -516,14 +634,14 @@ func (s *utxoCache) writeCache(dbTx database.Tx, bestState *BestState) error {
 	if batcher != nil {
 		// Preallocate roughly to expected live-entry count.
 		approxLive := 0
-		for i := range s.cachedEntries.maps {
-			approxLive += len(s.cachedEntries.maps[i])
+		for i := range ms.maps {
+			approxLive += len(ms.maps[i])
 		}
 		batch = make([]database.KVPair, 0, approxLive)
 	}
 
-	for i := range s.cachedEntries.maps {
-		for outpoint, entry := range s.cachedEntries.maps[i] {
+	for i := range ms.maps {
+		for outpoint, entry := range ms.maps[i] {
 			switch {
 			// If the entry is nil or spent, remove the entry from the database
 			// and the cache.
@@ -556,13 +674,24 @@ func (s *utxoCache) writeCache(dbTx database.Tx, bestState *BestState) error {
 				}
 			}
 
-			delete(s.cachedEntries.maps[i], outpoint)
+			if clearAsGo {
+				delete(ms.maps[i], outpoint)
+			}
 		}
 	}
 	if batcher != nil && len(batch) > 0 {
 		if err := batcher.PutBatch(batch); err != nil {
 			return err
 		}
+	}
+
+	return nil
+}
+
+// writeCache writes all the entries that are cached in memory to the database atomically.
+func (s *utxoCache) writeCache(dbTx database.Tx, bestState *BestState) error {
+	if err := writeMapSliceEntries(dbTx, &s.cachedEntries, true); err != nil {
+		return err
 	}
 	s.cachedEntries.deleteMaps()
 	s.totalEntryMemory = 0
@@ -620,6 +749,165 @@ func (s *utxoCache) flush(dbTx database.Tx, mode FlushMode, bestState *BestState
 	return nil
 }
 
+// reapAsyncFlush observes a previously-started background flush.  When
+// wait is true it blocks until the background goroutine finishes;
+// otherwise it returns immediately if the flush is still in progress.
+// On a completed flush it clears the frozen-snapshot bookkeeping and, on
+// success, advances the in-memory consistency hash to the snapshot's
+// marker (the durable marker was written by the background transaction
+// itself).  A background failure is fatal: the frozen deltas were
+// swapped out of the active cache and never persisted, so the only safe
+// recovery is to surface the error, stop, and let the next startup
+// replay from the un-advanced on-disk marker.
+//
+// MUST be called with the chain lock held (for writes) and MUST NOT be
+// called from inside an open database write transaction (the background
+// flush holds its own write transaction; MDBX permits a single writer).
+func (s *utxoCache) reapAsyncFlush(wait bool) error {
+	if s.flushDone == nil {
+		return nil
+	}
+
+	var err error
+	if wait {
+		err = <-s.flushDone
+	} else {
+		select {
+		case err = <-s.flushDone:
+		default:
+			return nil // still in progress
+		}
+	}
+
+	s.flushDone = nil
+	s.flushing = nil
+	s.flushingEntryMemory = 0
+	if err != nil {
+		return err
+	}
+
+	s.lastFlushHash = s.flushingHash
+	s.lastFlushTime = time.Now()
+	return nil
+}
+
+// drainAsyncFlush blocks until any in-progress background flush completes
+// and reaps it.  Used before operations that must observe a quiescent
+// cache and own the sole database writer: synchronous (FlushRequired)
+// flushes, reorganizations, and shutdown.
+//
+// MUST be called with the chain lock held and outside any open write txn.
+func (s *utxoCache) drainAsyncFlush() error {
+	return s.reapAsyncFlush(true)
+}
+
+// maybeAsyncFlush performs a non-blocking, double-buffered flush of the
+// active cache when it has grown past the memory threshold.  Instead of
+// writing the cache inline (which stalls block processing for the
+// multi-GiB, multi-minute duration of a full flush), it freezes the
+// active map, swaps in a fresh empty one, and hands the frozen snapshot
+// to a background goroutine that writes it in its own transaction.
+//
+// Reads fall through active -> frozen -> db (see cacheGet), and frozen
+// entries touched afterwards are copy-on-written into the active map, so
+// the background writer always sees the pristine swap-time snapshot.
+//
+// Crash safety rides on the existing lag+replay model: the durable
+// consistency marker only advances when the background transaction
+// commits the entire frozen snapshot atomically.  A crash mid-flush
+// leaves the older marker on disk and replay rebuilds from there.
+//
+// MUST be called with the chain lock held and outside any open write txn.
+func (s *utxoCache) maybeAsyncFlush(bestState *BestState, mode FlushMode) error {
+	// Reap a previously-completed background flush so its frozen map is
+	// released and a new one can be started.
+	if err := s.reapAsyncFlush(false); err != nil {
+		return err
+	}
+
+	// Determine the flush threshold from the mode, mirroring the
+	// synchronous flush().  FlushRequired never reaches here (callers
+	// route it to the synchronous path), but handle it defensively.
+	var threshold uint64
+	switch mode {
+	case FlushRequired:
+		threshold = 0
+
+	case FlushIfNeeded:
+		if bestState.Hash == s.lastFlushHash {
+			return nil
+		}
+		threshold = s.maxTotalMemoryUsage
+
+	case FlushPeriodic:
+		if time.Since(s.lastFlushTime) > utxoFlushPeriodicInterval {
+			threshold = 0
+		} else {
+			threshold = s.maxTotalMemoryUsage
+		}
+	}
+
+	// Nothing to do unless the active layer has crossed the threshold.
+	if s.totalMemoryUsage() < threshold {
+		return nil
+	}
+
+	// Nothing to flush if the active layer is empty (can happen for a
+	// time-triggered periodic flush right after a prior flush).
+	if s.cachedEntries.length() == 0 {
+		return nil
+	}
+
+	// Back-pressure: a background flush is still draining the previous
+	// snapshot and we cannot hold two frozen snapshots at once.  Wait for
+	// it to finish, then proceed.  This is the safety valve for the case
+	// where block processing outruns flush throughput.
+	if s.flushDone != nil {
+		if err := s.drainAsyncFlush(); err != nil {
+			return err
+		}
+	}
+
+	totalMiB := s.totalMemoryUsage() / ((1024 * 1024) + 1)
+	log.Infof("Async-flushing UTXO cache of %d MiB with %d entries in the "+
+		"background; block processing continues", totalMiB,
+		s.cachedEntries.length())
+
+	// Freeze the active map and swap in a fresh one.  The swap is cheap
+	// (slice-header moves).  Construct the frozen mapSlice fresh rather
+	// than copying s.cachedEntries by value — mapSlice embeds a Mutex and
+	// copying a held-by-value lock is a bug — moving the maps/maxEntries
+	// across gives the frozen snapshot its own zero-value mutex.
+	frozen := &mapSlice{
+		maps:                s.cachedEntries.maps,
+		maxEntries:          s.cachedEntries.maxEntries,
+		maxTotalMemoryUsage: s.cachedEntries.maxTotalMemoryUsage,
+	}
+	s.flushing = frozen
+	s.flushingEntryMemory = s.totalEntryMemory
+	s.flushingHash = bestState.Hash
+
+	s.cachedEntries = newEmptyMapSlice(s.maxTotalMemoryUsage)
+	s.totalEntryMemory = 0
+
+	markerHash := bestState.Hash
+	done := make(chan error, 1)
+	s.flushDone = done
+	go func(ms *mapSlice, hash chainhash.Hash) {
+		// clearAsGo=false: the chain writer may concurrently read this
+		// frozen snapshot via cacheGet, so the writer must not mutate
+		// the maps.  The snapshot is dropped wholesale once reaped.
+		done <- s.db.Update(func(dbTx database.Tx) error {
+			if err := writeMapSliceEntries(dbTx, ms, false); err != nil {
+				return err
+			}
+			return dbPutUtxoStateConsistency(dbTx, &hash)
+		})
+	}(frozen, markerHash)
+
+	return nil
+}
+
 // FlushUtxoCache flushes the UTXO state to the database if a flush is needed with the
 // given flush mode.
 //
@@ -627,6 +915,25 @@ func (s *utxoCache) flush(dbTx database.Tx, mode FlushMode, bestState *BestState
 func (b *BlockChain) FlushUtxoCache(mode FlushMode) error {
 	b.chainLock.Lock()
 	defer b.chainLock.Unlock()
+
+	// Any in-progress background flush must be drained first: it owns a
+	// separate write transaction (MDBX is single-writer) and its frozen
+	// snapshot must land before we either start a synchronous flush or
+	// hand off a new asynchronous one.  Draining happens outside the
+	// db.Update below for the same single-writer reason.
+	if b.utxoCache.asyncFlush {
+		if err := b.utxoCache.drainAsyncFlush(); err != nil {
+			return err
+		}
+
+		// For non-required modes, prefer the non-blocking background
+		// flush so callers (e.g. periodic flushers) don't stall.
+		// FlushRequired (shutdown) falls through to the synchronous
+		// path so the cache is guaranteed durable on return.
+		if mode != FlushRequired {
+			return b.utxoCache.maybeAsyncFlush(b.BestSnapshot(), mode)
+		}
+	}
 
 	return b.db.Update(func(dbTx database.Tx) error {
 		return b.utxoCache.flush(dbTx, mode, b.BestSnapshot())

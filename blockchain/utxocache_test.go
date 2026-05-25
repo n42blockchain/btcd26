@@ -962,3 +962,123 @@ func TestInitConsistentState(t *testing.T) {
 			blocks[len(blocks)-1].Height())
 	}
 }
+
+// TestUtxoCacheAsyncFlush exercises the opt-in double-buffered asynchronous
+// flush: the copy-on-write of a frozen entry that is spent after the swap,
+// the deferred advance of the consistency marker, and final on-disk
+// correctness once the background flush is drained.
+func TestUtxoCacheAsyncFlush(t *testing.T) {
+	chain, params, tearDown := utxoCacheTestChain("TestUtxoCacheAsyncFlush")
+	defer tearDown()
+	cache := chain.utxoCache
+	cache.asyncFlush = true // force on regardless of env
+
+	// Use a small cache budget so the swapped-in active map stays tiny;
+	// this keeps the test's memory footprint low enough for the race
+	// detector's shadow memory.
+	cache.maxTotalMemoryUsage = 1 * 1024 * 1024
+	cache.cachedEntries.maxTotalMemoryUsage = cache.maxTotalMemoryUsage
+
+	tip := btcutil.NewBlock(params.GenesisBlock)
+	tip.SetHeight(0)
+	state := chain.stateSnapshot
+
+	// Add 10 fresh utxos.
+	const n = 10
+	outPoints := make([]wire.OutPoint, n)
+	for i := range outPoints {
+		op := outpointFromInt(i)
+		outPoints[i] = op
+		txOut := wire.TxOut{Value: 10000, PkScript: getValidP2PKHScript()}
+		cache.addTxOut(op, &txOut, true, int32(i))
+	}
+	if cache.cachedEntries.length() != n {
+		t.Fatalf("expected %d active entries, got %d", n,
+			cache.cachedEntries.length())
+	}
+
+	// Trigger an async flush via the periodic path (threshold 0 once the
+	// last flush time is far enough in the past), so it fires regardless
+	// of the cache memory size.
+	cache.lastFlushTime = time.Now().Add(-2 * utxoFlushPeriodicInterval)
+	if err := cache.maybeAsyncFlush(state, FlushPeriodic); err != nil {
+		t.Fatalf("maybeAsyncFlush: %v", err)
+	}
+
+	// The active layer is now empty (swapped out) and a frozen snapshot
+	// is in flight.
+	if cache.flushing == nil {
+		t.Fatal("expected a frozen snapshot in flight")
+	}
+	if cache.cachedEntries.length() != 0 {
+		t.Fatalf("expected empty active layer after swap, got %d",
+			cache.cachedEntries.length())
+	}
+
+	// While the snapshot is (logically) in flight, spend one of the frozen
+	// utxos.  This must copy-on-write it into the active layer as a spent
+	// entry, leaving the frozen original pristine for the background
+	// writer.
+	spendOp := outPoints[5]
+	if err := cache.addTxIn(
+		&wire.TxIn{PreviousOutPoint: spendOp}, nil,
+	); err != nil {
+		t.Fatalf("addTxIn on frozen entry: %v", err)
+	}
+
+	// Add a brand-new utxo into the active layer too.
+	newOp := outpointFromInt(100)
+	newTxOut := wire.TxOut{Value: 5000, PkScript: getValidP2PKHScript()}
+	cache.addTxOut(newOp, &newTxOut, true, 100)
+
+	// Drain the background flush.  Afterwards the marker must have advanced
+	// to the swap-point hash and the frozen 10 entries must be on disk.
+	if err := cache.drainAsyncFlush(); err != nil {
+		t.Fatalf("drainAsyncFlush: %v", err)
+	}
+	if cache.flushing != nil {
+		t.Fatal("frozen snapshot should be cleared after drain")
+	}
+	if cache.lastFlushHash != state.Hash {
+		t.Fatalf("lastFlushHash should advance to %v, got %v",
+			state.Hash, cache.lastFlushHash)
+	}
+	if err := assertConsistencyState(chain, &state.Hash); err != nil {
+		t.Fatal(err)
+	}
+	// All 10 frozen entries are on disk (the spend lives only in the
+	// active layer until the next flush).
+	if err := assertNbEntriesOnDisk(chain, n); err != nil {
+		t.Fatal(err)
+	}
+
+	// Now synchronously flush the active layer (the spend + the new utxo).
+	if err := chain.db.Update(func(dbTx database.Tx) error {
+		return cache.flush(dbTx, FlushRequired, state)
+	}); err != nil {
+		t.Fatalf("sync flush of active layer: %v", err)
+	}
+
+	// Final on-disk set: 10 original - 1 spent + 1 new = 10.
+	if err := assertNbEntriesOnDisk(chain, n); err != nil {
+		t.Fatal(err)
+	}
+
+	// The spent outpoint must be gone; the new one present; an untouched
+	// original still present.
+	entries, err := cache.fetchEntries(
+		[]wire.OutPoint{spendOp, newOp, outPoints[0]},
+	)
+	if err != nil {
+		t.Fatalf("fetchEntries: %v", err)
+	}
+	if entries[0] != nil {
+		t.Fatal("spent frozen entry must be absent from the utxo set")
+	}
+	if entries[1] == nil || entries[1].Amount() != 5000 {
+		t.Fatal("new entry must be present with its amount")
+	}
+	if entries[2] == nil || entries[2].Amount() != 10000 {
+		t.Fatal("untouched original entry must be present")
+	}
+}
