@@ -1082,3 +1082,94 @@ func TestUtxoCacheAsyncFlush(t *testing.T) {
 		t.Fatal("untouched original entry must be present")
 	}
 }
+
+// TestUtxoCacheAsyncFlushChunked forces the chunked background flush to use
+// many small transactions and verifies the on-disk UTXO set is correct
+// across chunk boundaries (the marker is written only after every chunk,
+// and a frozen entry spent after the swap still flushes to a db delete).
+func TestUtxoCacheAsyncFlushChunked(t *testing.T) {
+	chain, _, tearDown := utxoCacheTestChain("TestUtxoCacheAsyncFlushChunked")
+	defer tearDown()
+	cache := chain.utxoCache
+	cache.asyncFlush = true
+	cache.maxTotalMemoryUsage = 1 * 1024 * 1024
+	cache.cachedEntries.maxTotalMemoryUsage = cache.maxTotalMemoryUsage
+
+	// Force many chunks: 3 entries per chunk transaction.
+	saved := asyncFlushChunkEntries
+	asyncFlushChunkEntries = 3
+	defer func() { asyncFlushChunkEntries = saved }()
+
+	state := chain.stateSnapshot
+
+	const n = 20
+	outPoints := make([]wire.OutPoint, n)
+	for i := range outPoints {
+		op := outpointFromInt(i)
+		outPoints[i] = op
+		txOut := wire.TxOut{Value: int64(10000 + i), PkScript: getValidP2PKHScript()}
+		cache.addTxOut(op, &txOut, true, int32(i))
+	}
+
+	// Async flush -> swaps 20 entries into a frozen snapshot flushed in
+	// ceil(20/3)=7 chunk transactions plus the marker transaction.
+	cache.lastFlushTime = time.Now().Add(-2 * utxoFlushPeriodicInterval)
+	if err := cache.maybeAsyncFlush(state, FlushPeriodic); err != nil {
+		t.Fatalf("maybeAsyncFlush: %v", err)
+	}
+	if cache.flushing == nil {
+		t.Fatal("expected frozen snapshot in flight")
+	}
+
+	// Spend two frozen entries while the snapshot is in flight (COW path).
+	for _, idx := range []int{4, 13} {
+		if err := cache.addTxIn(
+			&wire.TxIn{PreviousOutPoint: outPoints[idx]}, nil,
+		); err != nil {
+			t.Fatalf("addTxIn frozen entry %d: %v", idx, err)
+		}
+	}
+
+	if err := cache.drainAsyncFlush(); err != nil {
+		t.Fatalf("drainAsyncFlush: %v", err)
+	}
+	if cache.lastFlushHash != state.Hash {
+		t.Fatalf("marker should advance to %v, got %v", state.Hash,
+			cache.lastFlushHash)
+	}
+	if err := assertConsistencyState(chain, &state.Hash); err != nil {
+		t.Fatal(err)
+	}
+	// All 20 frozen entries are on disk (spends live in active layer).
+	if err := assertNbEntriesOnDisk(chain, n); err != nil {
+		t.Fatal(err)
+	}
+
+	// Flush the active layer (the two spends) synchronously.
+	if err := chain.db.Update(func(dbTx database.Tx) error {
+		return cache.flush(dbTx, FlushRequired, state)
+	}); err != nil {
+		t.Fatalf("sync flush active: %v", err)
+	}
+	// 20 - 2 spent = 18 on disk.
+	if err := assertNbEntriesOnDisk(chain, n-2); err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify content: spent gone, others present with correct amounts.
+	entries, err := cache.fetchEntries(outPoints)
+	if err != nil {
+		t.Fatalf("fetchEntries: %v", err)
+	}
+	for i, e := range entries {
+		if i == 4 || i == 13 {
+			if e != nil {
+				t.Fatalf("entry %d should be spent/absent", i)
+			}
+			continue
+		}
+		if e == nil || e.Amount() != int64(10000+i) {
+			t.Fatalf("entry %d wrong: %v", i, e)
+		}
+	}
+}
