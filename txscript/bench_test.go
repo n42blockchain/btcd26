@@ -536,3 +536,17 @@ func BenchmarkExtractPkScriptAddrs(b *testing.B) {
 		}
 	}
 }
+
+// BenchmarkPayToPubKeyHashScript measures construction of the fixed 25-byte
+// P2PKH template, which buildWitnessProgram rebuilds for every P2WPKH input
+// during full-block IBD.
+func BenchmarkPayToPubKeyHashScript(b *testing.B) {
+	pubKeyHash := hexToBytes("0102030405060708090a0b0c0d0e0f1011121314")
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		if _, err := payToPubKeyHashScript(pubKeyHash); err != nil {
+			b.Fatalf("unexpected err: %v", err)
+		}
+	}
+}

@@ -883,9 +883,25 @@ func CalcMultiSigStats(script []byte) (int, int, error) {
 // output to a 20-byte pubkey hash. It is expected that the input is a valid
 // hash.
 func payToPubKeyHashScript(pubKeyHash []byte) ([]byte, error) {
-	return NewScriptBuilder().AddOp(OP_DUP).AddOp(OP_HASH160).
-		AddData(pubKeyHash).AddOp(OP_EQUALVERIFY).AddOp(OP_CHECKSIG).
-		Script()
+	// A P2PKH script is the fixed 25-byte template
+	//   OP_DUP OP_HASH160 OP_DATA_20 <20-byte hash> OP_EQUALVERIFY OP_CHECKSIG
+	// with the hash as its only variable.  Build it directly to avoid the
+	// ScriptBuilder's struct + config + growing-buffer allocations: during
+	// full-block IBD, buildWitnessProgram rebuilds this template for every
+	// P2WPKH input, which showed up as ~7% of script-engine alloc churn in
+	// the pprof series.  Keep the builder fallback for the (invalid)
+	// non-20-byte case so error behavior is unchanged.
+	if len(pubKeyHash) != 20 {
+		return NewScriptBuilder().AddOp(OP_DUP).AddOp(OP_HASH160).
+			AddData(pubKeyHash).AddOp(OP_EQUALVERIFY).AddOp(OP_CHECKSIG).
+			Script()
+	}
+
+	script := make([]byte, 0, 25)
+	script = append(script, OP_DUP, OP_HASH160, OP_DATA_20)
+	script = append(script, pubKeyHash...)
+	script = append(script, OP_EQUALVERIFY, OP_CHECKSIG)
+	return script, nil
 }
 
 // payToWitnessPubKeyHashScript creates a new script to pay to a version 0
