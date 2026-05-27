@@ -3021,6 +3021,7 @@ func newServer(listenAddrs, agentBlacklist, agentWhitelist []string,
 		Prune:             cfg.Prune * 1024 * 1024,
 		PruneToCheckpoint: cfg.PruneToCheckpoint,
 		UtxoCacheMaxSize:  uint64(cfg.UtxoCacheMaxSizeMiB) * 1024 * 1024,
+		AssumeValid:       cfg.assumeValid,
 	})
 	if err != nil {
 		return nil, err

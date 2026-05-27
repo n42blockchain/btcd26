@@ -103,6 +103,12 @@ type BlockChain struct {
 	indexManager        IndexManager
 	hashCache           *txscript.HashCache
 
+	// assumeValid is the hash of a block whose scripts (and those of all
+	// its ancestors) are assumed valid, letting signature verification be
+	// skipped for that history during IBD.  A zero hash disables the
+	// optimization.  See Config.AssumeValid.
+	assumeValid chainhash.Hash
+
 	// The following fields are calculated based upon the provided chain
 	// parameters.  They are also set when the instance is created and
 	// can't be changed afterwards, so there is no need to protect them with
@@ -2513,6 +2519,15 @@ type Config struct {
 	// raw block bytes for pre-checkpoint heights are deleted.  Triggered
 	// by MaybePruneToLatestCheckpoint once the chain is current.
 	PruneToCheckpoint bool
+
+	// AssumeValid is the hash of a block whose scripts (and those of all
+	// its ancestors) are assumed valid.  When set, signature verification
+	// is skipped for that block and its ancestors during IBD, while every
+	// other consensus check still runs.  A zero hash disables the
+	// optimization (full script validation).  The caller is responsible
+	// for resolving the effective value (e.g. ChainParams.AssumeValid by
+	// default, overridable via a flag).
+	AssumeValid chainhash.Hash
 }
 
 // New returns a BlockChain instance using the provided configuration details.
@@ -2572,6 +2587,7 @@ func New(config *Config) (*BlockChain, error) {
 		deploymentCaches:    newThresholdCaches(chaincfg.DefinedDeployments),
 		pruneTarget:         config.Prune,
 		pruneToCheckpoint:   config.PruneToCheckpoint,
+		assumeValid:         config.AssumeValid,
 	}
 
 	// The asynchronous UTXO flush opens its own write transaction from a
@@ -2633,6 +2649,14 @@ func New(config *Config) (*BlockChain, error) {
 	log.Infof("Chain state (height %d, hash %v, totaltx %d, work %v)",
 		bestNode.height, bestNode.hash, b.stateSnapshot.TotalTxns,
 		bestNode.workSum)
+
+	// Surface the assume-valid setting so it is obvious when signature
+	// verification is being skipped for historical blocks during IBD.
+	if b.assumeValid != (chainhash.Hash{}) {
+		log.Infof("Assuming scripts valid for ancestors of block %v; "+
+			"signature verification is skipped for that history "+
+			"during initial block download", b.assumeValid)
+	}
 
 	return &b, nil
 }

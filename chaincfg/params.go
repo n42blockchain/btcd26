@@ -261,6 +261,20 @@ type Params struct {
 	// Checkpoints ordered from oldest to newest.
 	Checkpoints []Checkpoint
 
+	// AssumeValid is the hash of a block that is assumed to have valid
+	// scripts.  During initial block download, signature (script)
+	// verification is skipped for this block and all of its ancestors,
+	// since a recent, deeply-buried block commits to that history.  Every
+	// other consensus check (proof of work, Merkle root, UTXO availability,
+	// amounts, sigop limits, soft-fork rules) is still fully enforced, so a
+	// block that violates any of those is still rejected.  This mirrors
+	// Bitcoin Core's -assumevalid and is the single biggest IBD speedup,
+	// since script validation dominates CPU once past the last checkpoint.
+	//
+	// A zero hash disables the optimization (full script validation for
+	// every block).  The value may be overridden at runtime.
+	AssumeValid chainhash.Hash
+
 	// These fields are related to voting on consensus rule changes as
 	// defined by BIP0009.
 	//
@@ -373,6 +387,13 @@ var MainNetParams = Params{
 		{800000, newHashFromStr("00000000000000000002a7c4c1e48d76c5a37902165a270156b7a8d72728a054")},
 		{810000, newHashFromStr("000000000000000000028028ca82b6aa81ce789e4eb9e0321b74c3cbaf405dd1")},
 	},
+
+	// AssumeValid is mainnet block 900000, a deeply-buried block whose
+	// scripts are assumed valid so signature verification can be skipped
+	// for it and all of its ancestors during IBD.  All other consensus
+	// checks still run.  Override with --assumevalid=<hash> or disable
+	// with --assumevalid=0.
+	AssumeValid: *newHashFromStr("000000000000000000010538edbfd2d5b809a33dd83f284aeea41c6d0d96968a"),
 
 	// Consensus rule change deployments.
 	//

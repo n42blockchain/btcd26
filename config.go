@@ -105,6 +105,7 @@ type config struct {
 	AddrIndex            bool          `long:"addrindex" description:"Maintain a full address-based transaction index which makes the searchrawtransactions RPC available"`
 	AgentBlacklist       []string      `long:"agentblacklist" description:"A comma separated list of user-agent substrings which will cause btcd to reject any peers whose user-agent contains any of the blacklisted substrings."`
 	AgentWhitelist       []string      `long:"agentwhitelist" description:"A comma separated list of user-agent substrings which will cause btcd to require all peers' user-agents to contain one of the whitelisted substrings. The blacklist is applied before the whitelist, and an empty whitelist will allow all agents that do not fail the blacklist."`
+	AssumeValid          string        `long:"assumevalid" description:"If set, assume that the block and its ancestors are valid and skip script (signature) verification for them during initial block download. Defaults to a hard-coded recent block for the active network. Set to 0 to verify all scripts."`
 	BanDuration          time.Duration `long:"banduration" description:"How long to ban misbehaving peers.  Valid time units are {s, m, h}.  Minimum 1 second"`
 	BanThreshold         uint32        `long:"banthreshold" description:"Maximum allowed ban score before disconnecting and banning misbehaving peers."`
 	BlockMaxSize         uint32        `long:"blockmaxsize" description:"Maximum block size in bytes to be used when creating a block"`
@@ -192,6 +193,7 @@ type config struct {
 	miningAddrs          []address.Address
 	minRelayTxFee        btcutil.Amount
 	whitelists           []*net.IPNet
+	assumeValid          chainhash.Hash
 }
 
 // serviceOptions defines the configuration options for the daemon as a service on
@@ -1032,6 +1034,27 @@ func loadConfig() (*config, []string, error) {
 		fmt.Fprintln(os.Stderr, err)
 		fmt.Fprintln(os.Stderr, usageMessage)
 		return nil, nil, err
+	}
+
+	// Resolve the effective assume-valid block.  An empty flag falls back
+	// to the network's hard-coded default; "0" explicitly disables the
+	// optimization (every script is verified); anything else must be a
+	// valid block hash.
+	switch strings.TrimSpace(cfg.AssumeValid) {
+	case "":
+		cfg.assumeValid = activeNetParams.AssumeValid
+	case "0":
+		cfg.assumeValid = chainhash.Hash{}
+	default:
+		hash, err := chainhash.NewHashFromStr(cfg.AssumeValid)
+		if err != nil {
+			str := "%s: Error parsing assumevalid hash: %v"
+			err := fmt.Errorf(str, funcName, err)
+			fmt.Fprintln(os.Stderr, err)
+			fmt.Fprintln(os.Stderr, usageMessage)
+			return nil, nil, err
+		}
+		cfg.assumeValid = *hash
 	}
 
 	// Tor stream isolation requires either proxy or onion proxy to be set.

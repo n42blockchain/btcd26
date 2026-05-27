@@ -1111,6 +1111,36 @@ func CheckTransactionInputs(tx *btcutil.Tx, txHeight int32, utxoView *UtxoViewpo
 	return txFeeInSatoshi, nil
 }
 
+// isAssumeValidAncestor reports whether the given node is the configured
+// assume-valid block or one of its ancestors, in which case its script
+// signatures may be assumed valid and skipped.
+//
+// It returns false (i.e. keep full script validation) when the optimization
+// is disabled (zero hash) or when the assume-valid block is not yet present
+// in the block index, which happens until header sync has reached it.  The
+// ancestry is checked precisely via the node's skip list so that a side-chain
+// block at a height below the assume-valid block is never mistakenly skipped.
+func (b *BlockChain) isAssumeValidAncestor(node *blockNode) bool {
+	if b.assumeValid == (chainhash.Hash{}) {
+		return false
+	}
+
+	// Until the headers have reached the assume-valid block, validate fully.
+	avNode := b.index.LookupNode(&b.assumeValid)
+	if avNode == nil {
+		return false
+	}
+
+	// Only blocks at or below the assume-valid height can be its ancestors.
+	if node.height > avNode.height {
+		return false
+	}
+
+	// Confirm node actually lies on the chain leading to the assume-valid
+	// block rather than a same-height side-chain block.
+	return avNode.Ancestor(node.height) == node
+}
+
 // checkConnectBlock performs several checks to confirm connecting the passed
 // block to the chain represented by the passed view does not violate any rules.
 // In addition, the passed view is updated to spend all of the referenced
@@ -1285,6 +1315,15 @@ func (b *BlockChain) checkConnectBlock(node *blockNode, block *btcutil.Block, vi
 	checkpoint := b.LatestCheckpoint()
 	runScripts := true
 	if checkpoint != nil && node.height <= checkpoint.Height {
+		runScripts = false
+	}
+
+	// Also skip script verification when this block is the assumed-valid
+	// block or one of its ancestors.  Its scripts are assumed valid because
+	// a hard-coded, deeply-buried block commits to this history; every other
+	// consensus check above (sigops, inputs, amounts, sequence locks) still
+	// ran.  This is the dominant IBD cost once past the last checkpoint.
+	if runScripts && b.isAssumeValidAncestor(node) {
 		runScripts = false
 	}
 
