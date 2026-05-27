@@ -8,6 +8,7 @@ import (
 	"container/list"
 	"fmt"
 	"os"
+	"runtime"
 	"sync"
 	"time"
 
@@ -398,23 +399,12 @@ func (s *utxoCache) fetchEntries(outpoints []wire.OutPoint) ([]*UtxoEntry, error
 		return entries, nil
 	}
 
-	// Fetch the missing outpoints in the cache from the database.
+	// Fetch the missing outpoints from the database.  Large batches are
+	// read in parallel across several concurrent read transactions, since
+	// each lookup is an independent MDBX point query and the database
+	// permits many concurrent readers.
 	dbEntries := make([]*UtxoEntry, len(missingOps))
-	err := s.db.View(func(dbTx database.Tx) error {
-		utxoBucket := dbTx.Metadata().Bucket(utxoSetBucketName)
-
-		for i := range missingOps {
-			entry, err := dbFetchUtxoEntry(dbTx, utxoBucket, missingOps[i])
-			if err != nil {
-				return err
-			}
-
-			dbEntries[i] = entry
-		}
-
-		return nil
-	})
-	if err != nil {
+	if err := s.fetchMissingFromDB(missingOps, dbEntries); err != nil {
 		return nil, err
 	}
 
@@ -435,6 +425,98 @@ func (s *utxoCache) fetchEntries(outpoints []wire.OutPoint) ([]*UtxoEntry, error
 	}
 
 	return entries, nil
+}
+
+// parallelUtxoFetchMinBatch is the number of cache-missed outpoints below
+// which the database read stays single-threaded.  Spinning up worker
+// goroutines and extra read transactions is not worth it for a handful of
+// lookups; the threshold is only crossed by large blocks whose inputs miss
+// the cache, which is exactly where the read latency hurts IBD throughput.
+const parallelUtxoFetchMinBatch = 64
+
+// maxParallelUtxoFetchWorkers caps the fan-out so a single block's prefetch
+// never opens an unbounded number of concurrent read transactions.
+const maxParallelUtxoFetchWorkers = 8
+
+// fetchMissingFromDB loads the UTXO entries for missingOps into dbEntries
+// (index-aligned), reading large batches concurrently.  Each worker uses its
+// own read transaction over a disjoint range of missingOps, so no entry is
+// written by more than one goroutine and the cache itself is never touched
+// here -- callers add the results to the cache serially afterwards.
+func (s *utxoCache) fetchMissingFromDB(missingOps []wire.OutPoint,
+	dbEntries []*UtxoEntry) error {
+
+	// Decide how many workers to use: bounded by the CPU count, the hard
+	// cap, and the amount of work (at least parallelUtxoFetchMinBatch
+	// lookups per worker).
+	workers := runtime.NumCPU()
+	if workers > maxParallelUtxoFetchWorkers {
+		workers = maxParallelUtxoFetchWorkers
+	}
+	if maxByWork := len(missingOps) / parallelUtxoFetchMinBatch; workers > maxByWork {
+		workers = maxByWork
+	}
+
+	// Fall back to a single read transaction for small batches.
+	if workers <= 1 {
+		return s.fetchMissingChunk(missingOps, dbEntries, 0, len(missingOps))
+	}
+
+	chunk := (len(missingOps) + workers - 1) / workers
+	var wg sync.WaitGroup
+	errs := make([]error, workers)
+	for w := 0; w < workers; w++ {
+		lo := w * chunk
+		if lo >= len(missingOps) {
+			break
+		}
+		hi := lo + chunk
+		if hi > len(missingOps) {
+			hi = len(missingOps)
+		}
+
+		wg.Add(1)
+		go func(w, lo, hi int) {
+			defer wg.Done()
+
+			// Pin the goroutine to its OS thread for the lifetime of
+			// the read transaction.  The MDBX wrapper only locks the
+			// OS thread for writable transactions, so read
+			// transactions running concurrently across goroutines
+			// must each stay on a single thread themselves.
+			runtime.LockOSThread()
+			defer runtime.UnlockOSThread()
+
+			errs[w] = s.fetchMissingChunk(missingOps, dbEntries, lo, hi)
+		}(w, lo, hi)
+	}
+	wg.Wait()
+
+	for _, err := range errs {
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// fetchMissingChunk reads missingOps[lo:hi] into dbEntries[lo:hi] using a
+// single read transaction.
+func (s *utxoCache) fetchMissingChunk(missingOps []wire.OutPoint,
+	dbEntries []*UtxoEntry, lo, hi int) error {
+
+	return s.db.View(func(dbTx database.Tx) error {
+		utxoBucket := dbTx.Metadata().Bucket(utxoSetBucketName)
+		for i := lo; i < hi; i++ {
+			entry, err := dbFetchUtxoEntry(dbTx, utxoBucket, missingOps[i])
+			if err != nil {
+				return err
+			}
+
+			dbEntries[i] = entry
+		}
+		return nil
+	})
 }
 
 // addTxOut adds the specified output to the cache if it is not provably
